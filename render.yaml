@@ -1,0 +1,9 @@
+# Render deployment for SG Bus Arrivals
+services:
+  - type: web
+    name: sg-bus-mcp
+    runtime: docker
+    region: singapore
+    plan: free
+    healthCheckPath: /
+    # Render injects $PORT automatically; the Dockerfile listens on it.
