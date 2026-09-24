@@ -360,9 +360,9 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
             bus = svc.get(slot) or {}
             if not (bus.get("EstimatedArrival") or "").strip():
                 continue
-            code = (bus.get("DestinationCode") or "").strip()
-            if code:
-                dest_codes.add(code)
+            dest = (bus.get("DestinationCode") or "").strip()
+            if dest:
+                dest_codes.add(dest)
 
     dest_names: dict[str, str] = {}
     if dest_codes:
