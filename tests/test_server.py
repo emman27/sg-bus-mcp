@@ -24,10 +24,11 @@ def run(coro):
 # ------------------------------------------------------------------ tools
 
 
-def test_exactly_three_tools_exposed():
+def test_exactly_four_tools_exposed():
     tools = run(server.mcp.list_tools())
     assert sorted(t.name for t in tools) == [
         "bus_arrivals",
+        "bus_route",
         "find_bus_stops",
         "nearby_bus_stops",
     ]
@@ -337,3 +338,109 @@ def test_terms_page_loads(client):
     r = client.get("/terms")
     assert r.status_code == 200
     assert "as-is" in r.text
+
+
+# ---------------------------------------------------------- bus_route
+
+
+def _fake_route_pages(monkeypatch):
+    """Stub LTA with 6 route records + 3 stops; shrink the page size so the
+    paginated fetch is exercised without 500-record fixtures."""
+    routes = [
+        # Direction 1, deliberately out of sequence order: A -> B -> C
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 1, "StopSequence": 2,
+         "BusStopCode": "22222", "WD_FirstBus": "0535", "WD_LastBus": "2335"},
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 1, "StopSequence": 1,
+         "BusStopCode": "11111", "WD_FirstBus": "0530", "WD_LastBus": "2330"},
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 1, "StopSequence": 3,
+         "BusStopCode": "33333", "WD_FirstBus": "0540", "WD_LastBus": "2340"},
+        # Direction 2: C -> B -> A
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 2, "StopSequence": 1,
+         "BusStopCode": "33333", "WD_FirstBus": "0545", "WD_LastBus": "2345"},
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 2, "StopSequence": 2,
+         "BusStopCode": "22222", "WD_FirstBus": "0550", "WD_LastBus": "2350"},
+        {"ServiceNo": "106", "Operator": "TT", "Direction": 2, "StopSequence": 3,
+         "BusStopCode": "11111", "WD_FirstBus": "0555", "WD_LastBus": "2355"},
+    ]
+    stops = [
+        {"BusStopCode": "11111", "Description": "Stop A", "RoadName": "Road A"},
+        {"BusStopCode": "22222", "Description": "Stop B", "RoadName": "Road B"},
+        {"BusStopCode": "33333", "Description": "Stop C", "RoadName": "Road C"},
+    ]
+
+    async def fake_lta(api_key, path, params, demo=False):
+        assert path == "/BusRoutes", path
+        skip = params.get("$skip", 0)
+        return {"value": routes[skip:skip + server.STOP_PAGE_SIZE]}
+
+    async def fake_stops(api_key, demo=False):
+        return stops
+
+    monkeypatch.setattr(server, "_lta_get", fake_lta)
+    monkeypatch.setattr(server, "_get_all_bus_stops", fake_stops)
+    monkeypatch.setattr(server, "_bus_routes", None)
+    monkeypatch.setattr(server, "STOP_PAGE_SIZE", 2)
+
+
+def test_hhmm_formats_lta_times():
+    assert server._hhmm("2352") == "23:52"
+    assert server._hhmm("0530") == "05:30"
+    assert server._hhmm("") == ""
+    assert server._hhmm(None) == ""
+    assert server._hhmm("nope") == "nope"
+
+
+def test_bus_route_returns_both_directions_in_stop_order(monkeypatch):
+    _fake_route_pages(monkeypatch)
+    text = run(server.bus_route(FakeCtx(HEADER_KEY), "106"))
+
+    assert "106 — TT (2 directions):" in text
+    assert "Direction 1 → Stop C (3 stops):" in text
+    assert "Direction 2 → Stop A (3 stops):" in text
+
+    # Direction 1 sorted by StopSequence despite the shuffled input.
+    d1 = text.split("Direction 1")[1].split("Direction 2")[0]
+    assert d1.index("11111") < d1.index("22222") < d1.index("33333")
+    assert "Stop A (Road A)" in d1
+
+    # Weekday first/last bus come from the origin stop, formatted as HH:MM.
+    assert "Weekday first bus 05:30 from origin, last bus 23:30." in text
+
+
+def test_bus_route_normalises_service_number(monkeypatch):
+    _fake_route_pages(monkeypatch)
+    text = run(server.bus_route(FakeCtx(HEADER_KEY), " 106 "))
+    assert "106 — TT" in text
+
+
+def test_bus_route_unknown_service(monkeypatch):
+    _fake_route_pages(monkeypatch)
+    text = run(server.bus_route(FakeCtx(HEADER_KEY), "999"))
+    assert "couldn't find a route for service '999'" in text
+
+
+def test_bus_route_rejects_garbage_input():
+    for bad in ["", "!!", "abc def", "123456"]:
+        text = run(server.bus_route(FakeCtx(HEADER_KEY), bad))
+        assert "doesn't look like a bus service number" in text, bad
+
+
+def test_bus_route_caches_across_calls(monkeypatch):
+    _fake_route_pages(monkeypatch)
+    calls = {"n": 0}
+    inner = server._lta_get
+
+    async def counting(api_key, path, params, demo=False):
+        calls["n"] += 1
+        return await inner(api_key, path, params, demo=demo)
+
+    monkeypatch.setattr(server, "_lta_get", counting)
+    run(server.bus_route(FakeCtx(HEADER_KEY), "106"))
+    assert calls["n"] > 0
+    run(server.bus_route(FakeCtx(HEADER_KEY), "106"))
+    run(server.bus_route(FakeCtx(HEADER_KEY), "999"))  # cache hit, miss on lookup
+    assert calls["n"] > 0
+    # Second and third calls served entirely from cache: no new LTA hits.
+    first_total = calls["n"]
+    run(server.bus_route(FakeCtx(HEADER_KEY), "106"))
+    assert calls["n"] == first_total
