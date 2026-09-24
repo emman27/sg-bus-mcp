@@ -37,7 +37,7 @@ This connector uses **API keys** auth:
 
 | Tool | What it does |
 |---|---|
-| `bus_arrivals(bus_stop_code)` | Next 3 buses per service at a 5-digit stop code: minutes until arrival, crowding in plain words (seats / standing / limited standing), wheelchair accessibility, single/double deck. |
+| `bus_arrivals(bus_stop_code)` | Next 3 buses per service at a 5-digit stop code: minutes until arrival, crowding in plain words (seats / standing / limited standing), wheelchair accessibility, single/double deck, and direction — each bus's terminating stop from LTA's per-bus destination data (e.g. `→ Buona Vista Ter`; loop services marked `(loop)`). |
 | `find_bus_stops(query)` | Case-insensitive search over stop names and roads. The full stop list (~5k stops) is lazy-loaded from LTA on first call (paginated `$skip`) and cached in memory with a 24h TTL. |
 | `nearby_bus_stops(latitude, longitude, max_results=5, radius_m=500)` | Stops near a location (haversine distance), nearest first, with distance in metres. Enables a "buses near me" flow: resolve the user's location → this tool → `bus_arrivals`. |
 
