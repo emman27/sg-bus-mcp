@@ -398,13 +398,13 @@ def test_bus_route_returns_both_directions_in_stop_order(monkeypatch):
     assert "Direction 1 → Stop C (3 stops):" in text
     assert "Direction 2 → Stop A (3 stops):" in text
 
-    # Every stop line carries its direction tag, so a stop code read on its
-    # own can't be misattributed to the wrong direction.
-    assert "direction tag" in text
-    assert "[D1] 1. 11111 — Stop A (Road A)" in text
-    assert "[D1] 3. 33333 — Stop C (Road C)" in text
-    assert "[D2] 1. 33333 — Stop C (Road C)" in text
-    assert "[D2] 3. 11111 — Stop A (Road A)" in text
+    # Every stop line carries its destination tag, so a stop code read on
+    # its own can't be misattributed to the wrong direction.
+    assert "destination tag" in text
+    assert "[→ Stop C] 1. 11111 — Stop A (Road A)" in text
+    assert "[→ Stop C] 3. 33333 — Stop C (Road C)" in text
+    assert "[→ Stop A] 1. 33333 — Stop C (Road C)" in text
+    assert "[→ Stop A] 3. 11111 — Stop A (Road A)" in text
 
     # Direction 1 sorted by StopSequence despite the shuffled input.
     d1 = text.split("Direction 1")[1].split("Direction 2")[0]
