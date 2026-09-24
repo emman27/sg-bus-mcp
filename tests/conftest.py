@@ -39,3 +39,23 @@ def _clean_demo_state():
     server._demo_usage.clear()
     yield
     server._demo_usage.clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_static_data_state():
+    """Every test starts with empty static-data caches (disk + memory)."""
+    server._data_files.clear()
+    server._bus_stops = None
+    server._bus_stops_fetched_at = None
+    server._bus_routes = None
+    server._bus_routes_fetched_at = None
+    server._bus_routes_vintage = None
+    server._train_network = None
+    yield
+    server._data_files.clear()
+    server._bus_stops = None
+    server._bus_stops_fetched_at = None
+    server._bus_routes = None
+    server._bus_routes_fetched_at = None
+    server._bus_routes_vintage = None
+    server._train_network = None
