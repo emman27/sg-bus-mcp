@@ -718,9 +718,11 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     Give the service number as printed on the bus, e.g. "106", "106A" or
     "97e". Returns every direction with all stops in order — sequence
     number, 5-digit stop code, stop name and road — plus the operator and
-    the weekday first/last bus from the origin stop. The full route dataset
-    is cached for 24 hours so repeat lookups are fast (the first call warms
-    the cache and takes a little longer).
+    the weekday first/last bus from the origin stop. Every stop line is
+    tagged with its direction (e.g. [D1]); sequence numbers restart at 1
+    for each direction, so always read the tag, not just the stop code.
+    The full route dataset is cached for 24 hours so repeat lookups are
+    fast (the first call warms the cache and takes a little longer).
     """
     svc = (service_no or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{1,5}", svc):
@@ -752,6 +754,11 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     operator = next(iter(directions.values()))["operator"]
     dir_word = "direction" if len(directions) == 1 else "directions"
     lines = [f"{svc} — {operator} ({len(directions)} {dir_word}):"]
+    lines.append(
+        "How to read: every stop line starts with its direction tag, e.g. [D1]. "
+        "Sequence numbers restart at 1 for each direction — a stop code can "
+        "appear under more than one direction, so always check the tag."
+    )
     for direction in sorted(directions):
         bucket = directions[direction]
         stops = bucket["stops"]
@@ -769,7 +776,9 @@ async def bus_route(ctx: Context, service_no: str) -> str:
             )
         for i, s in enumerate(stops, 1):
             road = f" ({s['road']})" if s["road"] else ""
-            lines.append(f"{i}. {s['bus_stop_code']} — {s['description']}{road}")
+            lines.append(
+                f"[D{direction}] {i}. {s['bus_stop_code']} — {s['description']}{road}"
+            )
 
     text = "\n".join(lines)
     if is_demo:
