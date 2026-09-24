@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 
@@ -67,6 +68,22 @@ logging.basicConfig(
 )
 
 mcp = FastMCP("sg-bus-arrivals")
+
+# The MCP SDK's DNS-rebinding protection defaults to localhost-only hosts,
+# which 421s every request behind Fly's edge proxy. Allow our public
+# hostname (plus loopback for local dev/test) explicitly instead.
+_PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "sg-bus-mcp.fly.dev")
+mcp.settings.transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        _PUBLIC_HOST,
+        f"{_PUBLIC_HOST}:*",
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+    ],
+    allowed_origins=[f"https://{_PUBLIC_HOST}"],
+)
 
 
 # ------------------------------------------------------------------ auth
