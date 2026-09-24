@@ -205,6 +205,20 @@ def test_bus_arrivals_mixed_destinations_annotated_per_bus(monkeypatch):
     assert "20 min → 64009" in text  # unknown code falls back to the code
 
 
+def test_bus_arrivals_header_shows_requested_stop_code(monkeypatch):
+    async def fake_lta(api_key, path, params, demo=False):
+        assert params == {"BusStopCode": "19099"}
+        return _arrival_payload_with_direction()
+
+    async def fake_stops(api_key, demo=False):
+        return _canned_stops_with_terminals()
+
+    monkeypatch.setattr(server, "_lta_get", fake_lta)
+    monkeypatch.setattr(server, "_get_all_bus_stops", fake_stops)
+    text = run(server.bus_arrivals(FakeCtx(HEADER_KEY), "19099"))
+    assert text.startswith("Bus stop 19099 —")
+
+
 def test_bus_arrivals_without_destination_codes_has_no_arrows(monkeypatch):
     async def fake_lta(api_key, path, params, demo=False):
         return _arrival_payload()  # no OriginCode/DestinationCode at all
