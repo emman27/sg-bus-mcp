@@ -634,9 +634,10 @@ async def nearby_bus_stops(
 
 BUS_ROUTE_PAGE_BATCH = 5  # concurrent $skip pages per round when warming the route cache
 
-_bus_routes: Optional[dict[str, dict[int, dict[str, Any]]]] = None
-_bus_routes_fetched_at: Optional[datetime] = None
-_bus_routes_vintage: Optional[str] = None  # generated_at of the bundled file
+_bundled_routes: Optional[dict[str, dict[int, dict[str, Any]]]] = None
+_bundled_vintage: Optional[str] = None  # generated_at of the bundled file
+_live_routes: Optional[dict[str, dict[int, dict[str, Any]]]] = None
+_live_routes_fetched_at: Optional[datetime] = None
 _bus_routes_lock = asyncio.Lock()
 
 
@@ -710,22 +711,23 @@ def _get_bundled_bus_routes() -> Optional[dict[str, dict[int, dict[str, Any]]]]:
 
     Fully keyless: stop names come from the bundled stops file too. Returns
     None when the file is missing so the tool can fall back to a live LTA
-    fetch (which does need an API key).
+    fetch (which does need an API key). Bundled and live indexes live in
+    separate caches so one can never be mistaken for the other.
     """
-    global _bus_routes, _bus_routes_vintage
-    if _bus_routes is not None:
-        return _bus_routes
+    global _bundled_routes, _bundled_vintage
+    if _bundled_routes is not None:
+        return _bundled_routes
     doc = _load_data_file("bus_routes.json")
     if doc is None:
         return None
     stops_doc = _load_data_file("bus_stops.json")
     stops = stops_doc["records"] if stops_doc is not None else []
-    _bus_routes = _index_bus_routes(doc["records"], stops)
-    _bus_routes_vintage = doc.get("generated_at")
+    _bundled_routes = _index_bus_routes(doc["records"], stops)
+    _bundled_vintage = doc.get("generated_at")
     logger.info(
-        "Bus routes indexed from bundled data: %d services", len(_bus_routes)
+        "Bus routes indexed from bundled data: %d services", len(_bundled_routes)
     )
-    return _bus_routes
+    return _bundled_routes
 
 
 async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dict[int, dict[str, Any]]]:
@@ -735,34 +737,29 @@ async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dic
     read) — no more multi-second LTA warmup. Falls back to a live paginated
     LTA fetch (24h memory cache) when the bundled file is missing.
     """
-    global _bus_routes, _bus_routes_fetched_at, _bus_routes_vintage
+    global _live_routes, _live_routes_fetched_at
 
     doc = _load_data_file("bus_routes.json")
     if doc is not None:
-        _bus_routes_vintage = doc.get("generated_at")
-        if _bus_routes is None:
-            stops = await _get_all_bus_stops(api_key, demo=demo)
-            _bus_routes = _index_bus_routes(doc["records"], stops)
-            logger.info("Bus routes indexed from bundled data: %d services", len(_bus_routes))
-        return _bus_routes
+        return _get_bundled_bus_routes()
 
     now = datetime.now(timezone.utc)
     if (
-        _bus_routes is not None
-        and _bus_routes_fetched_at is not None
-        and now - _bus_routes_fetched_at < BUS_STOP_CACHE_TTL
+        _live_routes is not None
+        and _live_routes_fetched_at is not None
+        and now - _live_routes_fetched_at < BUS_STOP_CACHE_TTL
     ):
-        return _bus_routes
+        return _live_routes
 
     async with _bus_routes_lock:
         # Re-check inside the lock (another coroutine may have refreshed it).
         now = datetime.now(timezone.utc)
         if (
-            _bus_routes is not None
-            and _bus_routes_fetched_at is not None
-            and now - _bus_routes_fetched_at < BUS_STOP_CACHE_TTL
+            _live_routes is not None
+            and _live_routes_fetched_at is not None
+            and now - _live_routes_fetched_at < BUS_STOP_CACHE_TTL
         ):
-            return _bus_routes
+            return _live_routes
 
         logger.info("Refreshing bus route cache from LTA DataMall")
 
@@ -790,11 +787,10 @@ async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dic
         logger.info("Bus route cache: %d records", len(records))
 
         stops = await _get_all_bus_stops(api_key, demo=demo)
-        _bus_routes = _index_bus_routes(records, stops)
-        _bus_routes_fetched_at = now
-        _bus_routes_vintage = None
-        logger.info("Bus route cache refreshed: %d services", len(_bus_routes))
-        return _bus_routes
+        _live_routes = _index_bus_routes(records, stops)
+        _live_routes_fetched_at = now
+        logger.info("Bus route cache refreshed: %d services", len(_live_routes))
+        return _live_routes
 
 
 @mcp.tool()
@@ -818,6 +814,7 @@ async def bus_route(ctx: Context, service_no: str) -> str:
         )
 
     routes = _get_bundled_bus_routes()
+    from_bundled = routes is not None
     is_demo = False
     demo_remaining: int | None = None
     if routes is None:
@@ -875,8 +872,10 @@ async def bus_route(ctx: Context, service_no: str) -> str:
             )
 
     text = "\n".join(lines)
-    if _bus_routes_vintage:
-        text += f"\n\n—\nRoute data bundled {_bus_routes_vintage}; arrivals are live."
+    if from_bundled and _bundled_vintage:
+        text += f"\n\n—\nRoute data bundled {_bundled_vintage}; arrivals are live."
+    elif not from_bundled:
+        text += "\n\n—\nRoute data fetched live from LTA; arrivals are live."
     if is_demo:
         text += _demo_note(demo_remaining)
     return text
@@ -888,23 +887,17 @@ _STATIC_DATASETS = {
     "bus_stops": "/BusStops",
     "bus_routes": "/BusRoutes",
     "bus_services": "/BusServices",
-    # TEMP-DEBUG: raw payload probes for the train tools (revert before final)
-    "train_alerts": "/TrainServiceAlerts",
-    "pcd_realtime": "/PCDRealTime",
-    "pcd_forecast": "/PCDForecast",
 }
 
 
 @mcp.tool()
-async def dump_static_data(ctx: Context, dataset: str, skip: int = 0,
-                            train_line: str = "") -> str:
+async def dump_static_data(ctx: Context, dataset: str, skip: int = 0) -> str:
     """Maintenance: return one raw page (500 records) of an LTA static dataset.
 
-    Used by scripts/refresh_data.py to rebuild the bundled data/*.json files.
-    Not meant for everyday questions — it returns raw JSON, not friendly text.
-    dataset is one of: bus_stops, bus_routes, bus_services. skip pages through
-    the dataset in 500-record steps (0, 500, 1000, ...).
-    TEMP-DEBUG: train_line probes the PCD endpoints (revert before final).
+    Used by scripts/refresh_static_data.py to rebuild the bundled data/*.json
+    files. Not meant for everyday questions — it returns raw JSON, not
+    friendly text. dataset is one of: bus_stops, bus_routes, bus_services.
+    skip pages through the dataset in 500-record steps (0, 500, 1000, ...).
     """
     dataset = (dataset or "").strip().lower()
     if dataset not in _STATIC_DATASETS:
@@ -922,8 +915,6 @@ async def dump_static_data(ctx: Context, dataset: str, skip: int = 0,
 
     try:
         params: dict[str, Any] = {"$skip": skip}
-        if train_line.strip():
-            params["TrainLine"] = train_line.strip().upper()
         data = await _lta_get(
             api_key, _STATIC_DATASETS[dataset], params, demo=is_demo
         )
@@ -1044,30 +1035,51 @@ async def train_alerts(ctx: Context) -> str:
         text = str(exc)
         return text + _demo_note(demo_remaining) if is_demo else text
 
-    rows = data.get("value") or []
+    rows = data.get("value") or {}
     now = datetime.now(SGT).strftime("%-I:%M%p").lower().lstrip("0")
 
-    active = [r for r in rows if str(r.get("Status") or "") == "2"]
-    if not active:
+    # value is one object: {Status, AffectedSegments, Message[]} — not a list.
+    if isinstance(rows, list):
+        payload: dict[str, Any] = {}
+    else:
+        payload = rows if isinstance(rows, dict) else {}
+    status = str(payload.get("Status") or "").strip()
+    segments = payload.get("AffectedSegments") or []
+    messages = payload.get("Message") or []
+
+    def _format_message(m: Any) -> str:
+        if isinstance(m, dict):
+            content = str(m.get("Content") or "").strip()
+            created = str(m.get("CreatedDate") or "").strip()
+            return f"- {content} (posted {created})" if created else f"- {content}"
+        return f"- {m}"
+
+    if status != "2":
         text = f"All MRT/LRT lines are running normally as of {now} SGT."
+        if messages:
+            text += "\nPlanned works / notices:"
+            text += "\n" + "\n".join(_format_message(m) for m in messages)
         return text + _demo_note(demo_remaining) if is_demo else text
 
     blocks = [f"MRT/LRT service alerts — as of {now} SGT:"]
-    for r in active:
-        line = str(r.get("Line") or "").strip()
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        line = str(seg.get("Line") or "").strip()
         blocks.append(f"\n⚠️ {line} — disrupted")
-        if r.get("Direction"):
-            blocks.append(f"Direction: {r['Direction']}")
-        if r.get("Stations"):
-            blocks.append(f"Affected stations: {r['Stations']}")
-        if r.get("FreePublicBus"):
-            blocks.append(f"Free bridging buses: {r['FreePublicBus']}")
-        if r.get("FreeMRTShuttle"):
-            blocks.append(f"Free MRT shuttle: {r['FreeMRTShuttle']}")
-        if r.get("MRTShuttleDirection"):
-            blocks.append(f"Shuttle direction: {r['MRTShuttleDirection']}")
-        if r.get("Message"):
-            blocks.append(f"LTA advisory: {r['Message']}")
+        if seg.get("Direction"):
+            blocks.append(f"Direction: {seg['Direction']}")
+        if seg.get("Stations"):
+            blocks.append(f"Affected stations: {seg['Stations']}")
+        if seg.get("FreePublicBus"):
+            blocks.append(f"Free bridging buses: {seg['FreePublicBus']}")
+        if seg.get("FreeMRTShuttle"):
+            blocks.append(f"Free MRT shuttle: {seg['FreeMRTShuttle']}")
+        if seg.get("MRTShuttleDirection"):
+            blocks.append(f"Shuttle direction: {seg['MRTShuttleDirection']}")
+    if messages:
+        blocks.append("\nLTA advisories:")
+        blocks.extend(_format_message(m) for m in messages)
     text = "\n".join(blocks)
     return text + _demo_note(demo_remaining) if is_demo else text
 
@@ -1166,7 +1178,19 @@ async def station_crowd_forecast(
             data = await _lta_get(
                 api_key, "/PCDForecast", {"TrainLine": tl}, demo=is_demo
             )
-            rows.extend(data.get("value") or [])
+            # value: [{Date, Stations: [{Station, Interval: [{Start, CrowdLevel}]}]}]
+            for day in data.get("value") or []:
+                if not isinstance(day, dict):
+                    continue
+                for st in day.get("Stations") or []:
+                    if not isinstance(st, dict):
+                        continue
+                    scode = st.get("Station")
+                    for iv in st.get("Interval") or []:
+                        if not isinstance(iv, dict):
+                            continue
+                        rows.append({"Station": scode, "Start": iv.get("Start"),
+                                     "CrowdLevel": iv.get("CrowdLevel")})
     except (ValueError, RuntimeError) as exc:
         text = str(exc)
         return text + _demo_note(demo_remaining) if is_demo else text
