@@ -19,6 +19,7 @@ Exposed tools (all read-only):
     bus_arrivals(bus_stop_code)                 — next 3 buses per service at a stop
     find_bus_stops(query)                      — search bus stops by name / road
     nearby_bus_stops(latitude, longitude, ...) — bus stops near a location
+    bus_route(service_no)                      — full ordered route for a service
 """
 
 from __future__ import annotations
@@ -575,6 +576,201 @@ async def nearby_bus_stops(
             f"- {s.get('BusStopCode', '?')}: {s.get('Description', '?')} "
             f"({s.get('RoadName', '?')}) — {int(round(dist))} m away"
         )
+    text = "\n".join(lines)
+    if is_demo:
+        text += _demo_note(demo_remaining)
+    return text
+
+
+# ------------------------------------------------------- bus routes
+
+BUS_ROUTE_PAGE_BATCH = 5  # concurrent $skip pages per round when warming the route cache
+
+_bus_routes: Optional[dict[str, dict[int, dict[str, Any]]]] = None
+_bus_routes_fetched_at: Optional[datetime] = None
+_bus_routes_lock = asyncio.Lock()
+
+
+def _hhmm(raw: Any) -> str:
+    """'2352' -> '23:52'; anything unexpected comes back untouched."""
+    t = str(raw or "").strip()
+    if len(t) == 4 and t.isdigit():
+        return f"{t[:2]}:{t[2:]}"
+    return t
+
+
+async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dict[int, dict[str, Any]]]:
+    """Fetch and cache the full bus route dataset (paginated, 24h TTL).
+
+    Returns {service_no: {direction: {"operator", "first_bus", "last_bus",
+    "stops"}}} with stops sorted by StopSequence and enriched with names and
+    roads from the stop cache. Pages are fetched in small concurrent batches
+    because the dataset spans ~60 pages of 500 records; the 24h cache means
+    this warmup happens rarely.
+    """
+    global _bus_routes, _bus_routes_fetched_at
+
+    now = datetime.now(timezone.utc)
+    if (
+        _bus_routes is not None
+        and _bus_routes_fetched_at is not None
+        and now - _bus_routes_fetched_at < BUS_STOP_CACHE_TTL
+    ):
+        return _bus_routes
+
+    async with _bus_routes_lock:
+        # Re-check inside the lock (another coroutine may have refreshed it).
+        now = datetime.now(timezone.utc)
+        if (
+            _bus_routes is not None
+            and _bus_routes_fetched_at is not None
+            and now - _bus_routes_fetched_at < BUS_STOP_CACHE_TTL
+        ):
+            return _bus_routes
+
+        logger.info("Refreshing bus route cache from LTA DataMall")
+
+        async def _page(skip: int) -> tuple[int, list[dict[str, Any]]]:
+            data = await _lta_get(api_key, "/BusRoutes", {"$skip": skip}, demo=demo)
+            return skip, data.get("value") or []
+
+        records: list[dict[str, Any]] = []
+        skip = 0
+        while True:
+            pages = await asyncio.gather(
+                *(_page(skip + i * STOP_PAGE_SIZE) for i in range(BUS_ROUTE_PAGE_BATCH))
+            )
+            pages.sort(key=lambda p: p[0])
+            last = False
+            for _, page in pages:
+                records.extend(page)
+                if len(page) < STOP_PAGE_SIZE:
+                    last = True
+                    break
+            if last:
+                break
+            skip += BUS_ROUTE_PAGE_BATCH * STOP_PAGE_SIZE
+
+        logger.info("Bus route cache: %d records", len(records))
+
+        # Stop names/roads come from the (already cached) stop list — no extra LTA calls.
+        stops = await _get_all_bus_stops(api_key, demo=demo)
+        stop_info = {
+            str(s.get("BusStopCode")): (
+                str(s.get("Description") or "").strip(),
+                str(s.get("RoadName") or "").strip(),
+            )
+            for s in stops
+        }
+
+        index: dict[str, dict[int, dict[str, Any]]] = {}
+        for r in records:
+            svc = str(r.get("ServiceNo") or "").strip().upper()
+            if not svc:
+                continue
+            try:
+                direction = int(r.get("Direction"))
+            except (TypeError, ValueError):
+                continue
+            if direction not in (1, 2):
+                continue
+            code = str(r.get("BusStopCode") or "").strip()
+            desc, road = stop_info.get(code, ("", ""))
+            seq = r.get("StopSequence")
+            bucket = index.setdefault(svc, {}).setdefault(
+                direction,
+                {"operator": str(r.get("Operator") or "").strip(), "stops": []},
+            )
+            bucket["stops"].append(
+                {
+                    "sequence": seq if isinstance(seq, int) else 0,
+                    "bus_stop_code": code,
+                    "description": desc or code,
+                    "road": road,
+                    # First/last bus times are per stop in LTA's data; the
+                    # origin stop's times become the direction's headline.
+                    "wd_first": _hhmm(r.get("WD_FirstBus")),
+                    "wd_last": _hhmm(r.get("WD_LastBus")),
+                }
+            )
+
+        for svc_dirs in index.values():
+            for bucket in svc_dirs.values():
+                ordered = sorted(bucket["stops"], key=lambda e: e["sequence"])
+                origin = ordered[0] if ordered else {}
+                bucket["first_bus"] = origin.get("wd_first", "")
+                bucket["last_bus"] = origin.get("wd_last", "")
+                bucket["stops"] = [
+                    {k: e[k] for k in ("sequence", "bus_stop_code", "description", "road")}
+                    for e in ordered
+                ]
+
+        _bus_routes = index
+        _bus_routes_fetched_at = now
+        logger.info("Bus route cache refreshed: %d services", len(index))
+        return index
+
+
+@mcp.tool()
+async def bus_route(ctx: Context, service_no: str) -> str:
+    """Full ordered route for a Singapore bus service.
+
+    Give the service number as printed on the bus, e.g. "106", "106A" or
+    "97e". Returns every direction with all stops in order — sequence
+    number, 5-digit stop code, stop name and road — plus the operator and
+    the weekday first/last bus from the origin stop. The full route dataset
+    is cached for 24 hours so repeat lookups are fast (the first call warms
+    the cache and takes a little longer).
+    """
+    svc = (service_no or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{1,5}", svc):
+        return (
+            f"'{service_no}' doesn't look like a bus service number. Give the "
+            "number as printed on the bus, e.g. '106', '106A' or '97e'."
+        )
+
+    try:
+        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)  # missing key / demo exhausted — message already explains
+
+    try:
+        routes = await _get_all_bus_routes(api_key, demo=is_demo)
+    except (ValueError, RuntimeError) as exc:
+        text = str(exc)
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    directions = routes.get(svc)
+    if not directions:
+        text = (
+            f"I couldn't find a route for service '{service_no}'. Double-check "
+            "the service number — it should be the number printed on the bus, "
+            "e.g. '106' or '106A'."
+        )
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    operator = next(iter(directions.values()))["operator"]
+    dir_word = "direction" if len(directions) == 1 else "directions"
+    lines = [f"{svc} — {operator} ({len(directions)} {dir_word}):"]
+    for direction in sorted(directions):
+        bucket = directions[direction]
+        stops = bucket["stops"]
+        terminus = stops[-1]["description"] if stops else "?"
+        loop = (
+            " (loop)"
+            if stops and stops[0]["bus_stop_code"] == stops[-1]["bus_stop_code"]
+            else ""
+        )
+        lines.append(f"\nDirection {direction} → {terminus}{loop} ({len(stops)} stops):")
+        if bucket.get("first_bus") or bucket.get("last_bus"):
+            lines.append(
+                f"Weekday first bus {bucket['first_bus'] or '?'} from origin, "
+                f"last bus {bucket['last_bus'] or '?'}."
+            )
+        for i, s in enumerate(stops, 1):
+            road = f" ({s['road']})" if s["road"] else ""
+            lines.append(f"{i}. {s['bus_stop_code']} — {s['description']}{road}")
+
     text = "\n".join(lines)
     if is_demo:
         text += _demo_note(demo_remaining)
