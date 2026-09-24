@@ -32,6 +32,7 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,10 @@ BUS_STOP_CACHE_TTL = timedelta(hours=24)
 MAX_SEARCH_RESULTS = 20
 DEMO_BUDGET_PER_DAY = 10  # keyless calls per client IP per day via the demo key
 
+# Bundled static datasets (data/*.json). Loaded from disk on first use and
+# kept in memory afterwards — no LTA warmup, no request-time cold start.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
 LOAD_WORDS = {
     "SEA": "seats available",
     "SDA": "standing available",
@@ -69,7 +74,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-mcp = FastMCP("sg-bus-arrivals")
+mcp = FastMCP("sg-bus-train")
 
 # The MCP SDK's DNS-rebinding protection defaults to localhost-only hosts,
 # which 421s every request behind Fly's edge proxy. Allow our public
@@ -398,9 +403,35 @@ _bus_stops: Optional[list[dict[str, Any]]] = None
 _bus_stops_fetched_at: Optional[datetime] = None
 _bus_stops_lock = asyncio.Lock()
 
+_data_files: dict[str, dict[str, Any]] = {}
+
+
+def _load_data_file(name: str) -> Optional[dict[str, Any]]:
+    """Load a bundled JSON file from data/, kept in memory after first read.
+
+    Returns None when the file is missing — callers fall back to a live LTA
+    fetch so a partial checkout still works.
+    """
+    if name in _data_files:
+        return _data_files[name]
+    path = DATA_DIR / name
+    if not path.is_file():
+        return None
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    _data_files[name] = doc
+    logger.info(
+        "Loaded bundled static data %s (%d KB, generated %s)",
+        name, path.stat().st_size // 1024, doc.get("generated_at", "?"),
+    )
+    return doc
+
 
 async def _get_all_bus_stops(api_key: str, demo: bool = False) -> list[dict[str, Any]]:
-    """Fetch and cache the full bus stop list (paginated, 500/page, 24h TTL)."""
+    """Full bus stop list — bundled data/bus_stops.json, LTA only as fallback."""
+    doc = _load_data_file("bus_stops.json")
+    if doc is not None:
+        return doc["records"]
     global _bus_stops, _bus_stops_fetched_at
 
     now = datetime.now(timezone.utc)
@@ -444,23 +475,31 @@ async def find_bus_stops(ctx: Context, query: str) -> str:
 
     Give part of a stop name or road, e.g. "buona vista" or "orchard rd".
     Returns matching stops with their 5-digit codes, which you can then pass
-    to bus_arrivals. The full stop list is cached for 24 hours so repeat
-    searches are fast.
+    to bus_arrivals. Served from the bundled stop list — instant, and needs
+    no API key.
     """
     q = (query or "").strip().lower()
     if len(q) < 2:
         return "Please give at least 2 characters to search by, e.g. 'clementi' or 'orchard'."
 
-    try:
-        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
-    except (ValueError, RuntimeError) as exc:
-        return str(exc)  # missing key / demo exhausted — message already explains
+    doc = _load_data_file("bus_stops.json")
+    is_demo = False
+    demo_remaining: int | None = None
+    if doc is not None:
+        stops = doc["records"]
+    else:
+        # No bundled data (partial checkout) — fall back to a live LTA
+        # fetch, which does need an API key.
+        try:
+            api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+        except (ValueError, RuntimeError) as exc:
+            return str(exc)  # missing key / demo exhausted — message already explains
 
-    try:
-        stops = await _get_all_bus_stops(api_key, demo=is_demo)
-    except (ValueError, RuntimeError) as exc:
-        text = str(exc)
-        return text + _demo_note(demo_remaining) if is_demo else text
+        try:
+            stops = await _get_all_bus_stops(api_key, demo=is_demo)
+        except (ValueError, RuntimeError) as exc:
+            text = str(exc)
+            return text + _demo_note(demo_remaining) if is_demo else text
 
     matches = [
         s for s in stops
@@ -542,16 +581,24 @@ async def nearby_bus_stops(
     except (TypeError, ValueError):
         radius = 500
 
-    try:
-        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
-    except (ValueError, RuntimeError) as exc:
-        return str(exc)  # missing key / demo exhausted — message already explains
+    doc = _load_data_file("bus_stops.json")
+    is_demo = False
+    demo_remaining: int | None = None
+    if doc is not None:
+        stops = doc["records"]
+    else:
+        # No bundled data (partial checkout) — fall back to a live LTA
+        # fetch, which does need an API key.
+        try:
+            api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+        except (ValueError, RuntimeError) as exc:
+            return str(exc)  # missing key / demo exhausted — message already explains
 
-    try:
-        stops = await _get_all_bus_stops(api_key, demo=is_demo)
-    except (ValueError, RuntimeError) as exc:
-        text = str(exc)
-        return text + _demo_note(demo_remaining) if is_demo else text
+        try:
+            stops = await _get_all_bus_stops(api_key, demo=is_demo)
+        except (ValueError, RuntimeError) as exc:
+            text = str(exc)
+            return text + _demo_note(demo_remaining) if is_demo else text
 
     scored: list[tuple[float, dict]] = []
     for s in stops:
@@ -589,6 +636,7 @@ BUS_ROUTE_PAGE_BATCH = 5  # concurrent $skip pages per round when warming the ro
 
 _bus_routes: Optional[dict[str, dict[int, dict[str, Any]]]] = None
 _bus_routes_fetched_at: Optional[datetime] = None
+_bus_routes_vintage: Optional[str] = None  # generated_at of the bundled file
 _bus_routes_lock = asyncio.Lock()
 
 
@@ -600,16 +648,103 @@ def _hhmm(raw: Any) -> str:
     return t
 
 
-async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dict[int, dict[str, Any]]]:
-    """Fetch and cache the full bus route dataset (paginated, 24h TTL).
+def _index_bus_routes(
+    records: list[dict[str, Any]], stops: list[dict[str, Any]]
+) -> dict[str, dict[int, dict[str, Any]]]:
+    """Build {service_no: {direction: {...}}} from raw /BusRoutes records."""
+    # Stop names/roads come from the stop list — no extra LTA calls.
+    stop_info = {
+        str(s.get("BusStopCode")): (
+            str(s.get("Description") or "").strip(),
+            str(s.get("RoadName") or "").strip(),
+        )
+        for s in stops
+    }
 
-    Returns {service_no: {direction: {"operator", "first_bus", "last_bus",
-    "stops"}}} with stops sorted by StopSequence and enriched with names and
-    roads from the stop cache. Pages are fetched in small concurrent batches
-    because the dataset spans ~60 pages of 500 records; the 24h cache means
-    this warmup happens rarely.
+    index: dict[str, dict[int, dict[str, Any]]] = {}
+    for r in records:
+        svc = str(r.get("ServiceNo") or "").strip().upper()
+        if not svc:
+            continue
+        try:
+            direction = int(r.get("Direction"))
+        except (TypeError, ValueError):
+            continue
+        if direction not in (1, 2):
+            continue
+        code = str(r.get("BusStopCode") or "").strip()
+        desc, road = stop_info.get(code, ("", ""))
+        seq = r.get("StopSequence")
+        bucket = index.setdefault(svc, {}).setdefault(
+            direction,
+            {"operator": str(r.get("Operator") or "").strip(), "stops": []},
+        )
+        bucket["stops"].append(
+            {
+                "sequence": seq if isinstance(seq, int) else 0,
+                "bus_stop_code": code,
+                "description": desc or code,
+                "road": road,
+                # First/last bus times are per stop in LTA's data; the
+                # origin stop's times become the direction's headline.
+                "wd_first": _hhmm(r.get("WD_FirstBus")),
+                "wd_last": _hhmm(r.get("WD_LastBus")),
+            }
+        )
+
+    for svc_dirs in index.values():
+        for bucket in svc_dirs.values():
+            ordered = sorted(bucket["stops"], key=lambda e: e["sequence"])
+            origin = ordered[0] if ordered else {}
+            bucket["first_bus"] = origin.get("wd_first", "")
+            bucket["last_bus"] = origin.get("wd_last", "")
+            bucket["stops"] = [
+                {k: e[k] for k in ("sequence", "bus_stop_code", "description", "road")}
+                for e in ordered
+            ]
+    return index
+
+
+def _get_bundled_bus_routes() -> Optional[dict[str, dict[int, dict[str, Any]]]]:
+    """Indexed routes from the bundled data/bus_routes.json.
+
+    Fully keyless: stop names come from the bundled stops file too. Returns
+    None when the file is missing so the tool can fall back to a live LTA
+    fetch (which does need an API key).
     """
-    global _bus_routes, _bus_routes_fetched_at
+    global _bus_routes, _bus_routes_vintage
+    if _bus_routes is not None:
+        return _bus_routes
+    doc = _load_data_file("bus_routes.json")
+    if doc is None:
+        return None
+    stops_doc = _load_data_file("bus_stops.json")
+    stops = stops_doc["records"] if stops_doc is not None else []
+    _bus_routes = _index_bus_routes(doc["records"], stops)
+    _bus_routes_vintage = doc.get("generated_at")
+    logger.info(
+        "Bus routes indexed from bundled data: %d services", len(_bus_routes)
+    )
+    return _bus_routes
+
+
+async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dict[int, dict[str, Any]]]:
+    """Full bus route dataset.
+
+    Served from the bundled data/bus_routes.json (disk, in-memory after first
+    read) — no more multi-second LTA warmup. Falls back to a live paginated
+    LTA fetch (24h memory cache) when the bundled file is missing.
+    """
+    global _bus_routes, _bus_routes_fetched_at, _bus_routes_vintage
+
+    doc = _load_data_file("bus_routes.json")
+    if doc is not None:
+        _bus_routes_vintage = doc.get("generated_at")
+        if _bus_routes is None:
+            stops = await _get_all_bus_stops(api_key, demo=demo)
+            _bus_routes = _index_bus_routes(doc["records"], stops)
+            logger.info("Bus routes indexed from bundled data: %d services", len(_bus_routes))
+        return _bus_routes
 
     now = datetime.now(timezone.utc)
     if (
@@ -654,62 +789,12 @@ async def _get_all_bus_routes(api_key: str, demo: bool = False) -> dict[str, dic
 
         logger.info("Bus route cache: %d records", len(records))
 
-        # Stop names/roads come from the (already cached) stop list — no extra LTA calls.
         stops = await _get_all_bus_stops(api_key, demo=demo)
-        stop_info = {
-            str(s.get("BusStopCode")): (
-                str(s.get("Description") or "").strip(),
-                str(s.get("RoadName") or "").strip(),
-            )
-            for s in stops
-        }
-
-        index: dict[str, dict[int, dict[str, Any]]] = {}
-        for r in records:
-            svc = str(r.get("ServiceNo") or "").strip().upper()
-            if not svc:
-                continue
-            try:
-                direction = int(r.get("Direction"))
-            except (TypeError, ValueError):
-                continue
-            if direction not in (1, 2):
-                continue
-            code = str(r.get("BusStopCode") or "").strip()
-            desc, road = stop_info.get(code, ("", ""))
-            seq = r.get("StopSequence")
-            bucket = index.setdefault(svc, {}).setdefault(
-                direction,
-                {"operator": str(r.get("Operator") or "").strip(), "stops": []},
-            )
-            bucket["stops"].append(
-                {
-                    "sequence": seq if isinstance(seq, int) else 0,
-                    "bus_stop_code": code,
-                    "description": desc or code,
-                    "road": road,
-                    # First/last bus times are per stop in LTA's data; the
-                    # origin stop's times become the direction's headline.
-                    "wd_first": _hhmm(r.get("WD_FirstBus")),
-                    "wd_last": _hhmm(r.get("WD_LastBus")),
-                }
-            )
-
-        for svc_dirs in index.values():
-            for bucket in svc_dirs.values():
-                ordered = sorted(bucket["stops"], key=lambda e: e["sequence"])
-                origin = ordered[0] if ordered else {}
-                bucket["first_bus"] = origin.get("wd_first", "")
-                bucket["last_bus"] = origin.get("wd_last", "")
-                bucket["stops"] = [
-                    {k: e[k] for k in ("sequence", "bus_stop_code", "description", "road")}
-                    for e in ordered
-                ]
-
-        _bus_routes = index
+        _bus_routes = _index_bus_routes(records, stops)
         _bus_routes_fetched_at = now
-        logger.info("Bus route cache refreshed: %d services", len(index))
-        return index
+        _bus_routes_vintage = None
+        logger.info("Bus route cache refreshed: %d services", len(_bus_routes))
+        return _bus_routes
 
 
 @mcp.tool()
@@ -722,9 +807,8 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     the weekday first/last bus from the origin stop. Every stop line is
     tagged with its destination (e.g. [→ Shenton Way Ter]); sequence
     numbers restart at 1 for each direction, so always read the tag, not
-    just the stop code. The full route dataset is cached for 24 hours so
-    repeat lookups are fast (the first call warms the cache and takes a
-    little longer).
+    just the stop code. Served from the bundled route dataset — instant,
+    and needs no API key.
     """
     svc = (service_no or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{1,5}", svc):
@@ -733,16 +817,22 @@ async def bus_route(ctx: Context, service_no: str) -> str:
             "number as printed on the bus, e.g. '106', '106A' or '97e'."
         )
 
-    try:
-        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
-    except (ValueError, RuntimeError) as exc:
-        return str(exc)  # missing key / demo exhausted — message already explains
+    routes = _get_bundled_bus_routes()
+    is_demo = False
+    demo_remaining: int | None = None
+    if routes is None:
+        # No bundled data (partial checkout) — fall back to a live LTA
+        # fetch, which does need an API key.
+        try:
+            api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+        except (ValueError, RuntimeError) as exc:
+            return str(exc)  # missing key / demo exhausted — message already explains
 
-    try:
-        routes = await _get_all_bus_routes(api_key, demo=is_demo)
-    except (ValueError, RuntimeError) as exc:
-        text = str(exc)
-        return text + _demo_note(demo_remaining) if is_demo else text
+        try:
+            routes = await _get_all_bus_routes(api_key, demo=is_demo)
+        except (ValueError, RuntimeError) as exc:
+            text = str(exc)
+            return text + _demo_note(demo_remaining) if is_demo else text
 
     directions = routes.get(svc)
     if not directions:
@@ -785,6 +875,8 @@ async def bus_route(ctx: Context, service_no: str) -> str:
             )
 
     text = "\n".join(lines)
+    if _bus_routes_vintage:
+        text += f"\n\n—\nRoute data bundled {_bus_routes_vintage}; arrivals are live."
     if is_demo:
         text += _demo_note(demo_remaining)
     return text
@@ -834,6 +926,359 @@ async def dump_static_data(ctx: Context, dataset: str, skip: int = 0) -> str:
     return json.dumps({"skip": skip, "count": len(records), "records": records})
 
 
+# ------------------------------------------------------------- trains
+
+# Canonical LTA line codes, plus the aliases people actually type. Stripped
+# of non-letters before lookup, so "North South Line" and "north-south" both
+# hit NORTHSOUTHLINE.
+_TRAIN_LINE_ALIASES = {
+    "NSL": "NSL", "NS": "NSL", "NORTHSOUTH": "NSL", "NORTHSOUTHLINE": "NSL",
+    "EWL": "EWL", "EW": "EWL", "EASTWEST": "EWL", "EASTWESTLINE": "EWL",
+    "NEL": "NEL", "NE": "NEL", "NORTHEAST": "NEL", "NORTHEASTLINE": "NEL",
+    "CCL": "CCL", "CC": "CCL", "CIRCLE": "CCL", "CIRCLELINE": "CCL", "CEL": "CCL",
+    "DTL": "DTL", "DT": "DTL", "DOWNTOWN": "DTL", "DOWNTOWNLINE": "DTL",
+    "TEL": "TEL", "TE": "TEL", "THOMSON": "TEL",
+    "THOMSONEASTCOAST": "TEL", "THOMSONEASTCOASTLINE": "TEL",
+    "BPL": "BPL", "BP": "BPL", "BUKITPANJANG": "BPL", "BUKITPANJANGLRT": "BPL",
+    "SLRT": "SLRT", "STL": "SLRT", "SK": "SLRT",
+    "SENGKANG": "SLRT", "SENGKANGLRT": "SLRT",
+    "PLRT": "PLRT", "PTL": "PLRT", "PG": "PLRT",
+    "PUNGGOL": "PLRT", "PUNGGOLLRT": "PLRT",
+}
+
+TRAIN_LINES = ["NSL", "EWL", "NEL", "CCL", "DTL", "TEL", "BPL", "SLRT", "PLRT"]
+
+_CROWD_WORDS = {"l": "low", "m": "moderate", "h": "high"}
+
+
+def _normalize_train_line(raw: str) -> Optional[str]:
+    """Map a user's line name/code to a canonical LTA line code."""
+    key = re.sub(r"[^A-Z]", "", (raw or "").upper())
+    return _TRAIN_LINE_ALIASES.get(key)
+
+
+def _pcd_train_lines(code: str) -> list[str]:
+    """LTA PCD codes to query: the Circle and Changi extensions are split."""
+    if code == "CCL":
+        return ["CCL", "CEL"]
+    if code == "EWL":
+        return ["EWL", "CGL"]
+    return [code]
+
+
+def _crowd_word(level: Any) -> str:
+    return _CROWD_WORDS.get(str(level or "").strip().lower(), "no data")
+
+
+def _sgt_clock(iso: Any) -> str:
+    """'2021-09-15T09:40:00+08:00' -> '9:40am'."""
+    try:
+        dt = datetime.fromisoformat(str(iso))
+    except (ValueError, TypeError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    sgt = dt.astimezone(SGT)
+    return sgt.strftime("%-I:%M%p").lower().lstrip("0")
+
+
+_train_network: Optional[dict[str, Any]] = None
+
+
+def _get_train_network() -> dict[str, Any]:
+    """Bundled MRT/LRT station map with per-code and per-line indexes."""
+    global _train_network
+    if _train_network is not None:
+        return _train_network
+    doc = _load_data_file("mrt_stations.json")
+    if doc is None:
+        raise RuntimeError("The train station map isn't bundled on this server.")
+    by_code: dict[str, dict[str, Any]] = {}
+    for station in doc["stations"]:
+        for code in station["codes"]:
+            by_code[str(code).upper()] = station
+    _train_network = {
+        "generated_at": doc.get("generated_at"),
+        "lines": doc["lines"],
+        "stations": doc["stations"],
+        "by_code": by_code,
+    }
+    return _train_network
+
+
+def _station_name(code: str) -> str:
+    """Station name for an LTA station code, '' when unknown."""
+    try:
+        net = _get_train_network()
+    except RuntimeError:
+        return ""
+    station = net["by_code"].get((code or "").strip().upper())
+    return station["name"] if station else ""
+
+
+@mcp.tool()
+async def train_alerts(ctx: Context) -> str:
+    """Live MRT/LRT service status and disruption alerts from LTA.
+
+    No arguments. Reports any disrupted lines (affected stations, directions,
+    free bridging buses / MRT shuttles, LTA's advisory message), or confirms
+    all lines are running normally. Updated ad hoc by LTA.
+    """
+    try:
+        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)  # missing key / demo exhausted — message already explains
+
+    try:
+        data = await _lta_get(api_key, "/TrainServiceAlerts", {}, demo=is_demo)
+    except (ValueError, RuntimeError) as exc:
+        text = str(exc)
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    rows = data.get("value") or []
+    now = datetime.now(SGT).strftime("%-I:%M%p").lower().lstrip("0")
+
+    active = [r for r in rows if str(r.get("Status") or "") == "2"]
+    if not active:
+        text = f"All MRT/LRT lines are running normally as of {now} SGT."
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    blocks = [f"MRT/LRT service alerts — as of {now} SGT:"]
+    for r in active:
+        line = str(r.get("Line") or "").strip()
+        blocks.append(f"\n⚠️ {line} — disrupted")
+        if r.get("Direction"):
+            blocks.append(f"Direction: {r['Direction']}")
+        if r.get("Stations"):
+            blocks.append(f"Affected stations: {r['Stations']}")
+        if r.get("FreePublicBus"):
+            blocks.append(f"Free bridging buses: {r['FreePublicBus']}")
+        if r.get("FreeMRTShuttle"):
+            blocks.append(f"Free MRT shuttle: {r['FreeMRTShuttle']}")
+        if r.get("MRTShuttleDirection"):
+            blocks.append(f"Shuttle direction: {r['MRTShuttleDirection']}")
+        if r.get("Message"):
+            blocks.append(f"LTA advisory: {r['Message']}")
+    text = "\n".join(blocks)
+    return text + _demo_note(demo_remaining) if is_demo else text
+
+
+@mcp.tool()
+async def station_crowding(
+    ctx: Context, train_line: str, station: str = ""
+) -> str:
+    """Live platform crowding for MRT/LRT stations on one line.
+
+    train_line: e.g. "NSL", "EWL", "CCL", "DTL", "TEL", "BPL", "SLRT", "PLRT"
+    (names like "Circle Line" work too). station: optionally filter to one
+    station by code or name, e.g. "NS24" or "dhoby ghaut". LTA updates the
+    data about every 10 minutes.
+    """
+    code = _normalize_train_line(train_line)
+    if code is None:
+        return (
+            f"Unknown train line {train_line!r}. "
+            f"Try one of: {', '.join(TRAIN_LINES)}."
+        )
+
+    try:
+        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)  # missing key / demo exhausted — message already explains
+
+    try:
+        rows: list[dict[str, Any]] = []
+        for tl in _pcd_train_lines(code):
+            data = await _lta_get(
+                api_key, "/PCDRealTime", {"TrainLine": tl}, demo=is_demo
+            )
+            rows.extend(data.get("value") or [])
+    except (ValueError, RuntimeError) as exc:
+        text = str(exc)
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    q = (station or "").strip().lower()
+    if q:
+        rows = [
+            r
+            for r in rows
+            if q in str(r.get("Station") or "").lower()
+            or q in _station_name(str(r.get("Station") or "")).lower()
+        ]
+        if not rows:
+            return f"No stations matching {station!r} on the {code} line."
+
+    interval = ""
+    if rows:
+        start = _sgt_clock(rows[0].get("StartTime"))
+        end = _sgt_clock(rows[0].get("EndTime"))
+        if start and end:
+            interval = f" — live, {start}–{end} SGT"
+
+    lines = [f"{code} platform crowding{interval}:"]
+    for r in rows:
+        scode = str(r.get("Station") or "").strip()
+        name = _station_name(scode)
+        label = f"{scode} {name}".strip() or scode
+        lines.append(f"- {label}: {_crowd_word(r.get('CrowdLevel'))}")
+    text = "\n".join(lines)
+    return text + _demo_note(demo_remaining) if is_demo else text
+
+
+@mcp.tool()
+async def station_crowd_forecast(
+    ctx: Context, train_line: str, station: str = "", hours: int = 4
+) -> str:
+    """Forecast MRT/LRT station crowding in 30-minute slots.
+
+    train_line: e.g. "NSL", "EWL", "CCL" (names work too). station: optionally
+    filter to one station by code or name. hours: how far ahead to show
+    (default 4, max 12). LTA refreshes the forecast about once a day.
+    """
+    code = _normalize_train_line(train_line)
+    if code is None:
+        return (
+            f"Unknown train line {train_line!r}. "
+            f"Try one of: {', '.join(TRAIN_LINES)}."
+        )
+    try:
+        hours = max(1, min(int(hours), 12))
+    except (TypeError, ValueError):
+        hours = 4
+
+    try:
+        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)  # missing key / demo exhausted — message already explains
+
+    try:
+        rows: list[dict[str, Any]] = []
+        for tl in _pcd_train_lines(code):
+            data = await _lta_get(
+                api_key, "/PCDForecast", {"TrainLine": tl}, demo=is_demo
+            )
+            rows.extend(data.get("value") or [])
+    except (ValueError, RuntimeError) as exc:
+        text = str(exc)
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    now = datetime.now(SGT)
+    window_start = now - timedelta(minutes=30)
+    window_end = now + timedelta(hours=hours)
+
+    upcoming: list[tuple[datetime, dict[str, Any]]] = []
+    for r in rows:
+        try:
+            start = datetime.fromisoformat(str(r.get("Start")))
+        except (ValueError, TypeError):
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        start = start.astimezone(SGT)
+        if window_start <= start < window_end:
+            upcoming.append((start, r))
+
+    q = (station or "").strip().lower()
+    if q:
+        upcoming = [
+            (s, r)
+            for s, r in upcoming
+            if q in str(r.get("Station") or "").lower()
+            or q in _station_name(str(r.get("Station") or "")).lower()
+        ]
+        if not upcoming:
+            return f"No forecast for stations matching {station!r} on the {code}."
+
+    by_station: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
+    for start, r in upcoming:
+        by_station.setdefault(str(r.get("Station") or "").strip(), []).append((start, r))
+
+    # Present stations in line order from the bundled map.
+    order: list[str] = []
+    try:
+        order = [c.upper() for c in _get_train_network()["lines"][code]["codes"]]
+    except (RuntimeError, KeyError):
+        pass
+    codes = [c for c in order if c in by_station]
+    codes += [c for c in by_station if c not in codes]
+
+    from_sgt = now.strftime("%-I:%M%p").lower().lstrip("0")
+    lines = [f"{code} crowd forecast — next {hours}h from {from_sgt} SGT:"]
+    for scode in codes:
+        name = _station_name(scode)
+        label = f"{scode} {name}".strip() or scode
+        slots = sorted(by_station[scode], key=lambda t: t[0])
+        desc = " · ".join(
+            f"{s.strftime('%-I:%M%p').lower().lstrip('0')} {_crowd_word(r.get('CrowdLevel'))}"
+            for s, r in slots
+        )
+        lines.append(f"- {label}: {desc}")
+    text = "\n".join(lines)
+    return text + _demo_note(demo_remaining) if is_demo else text
+
+
+@mcp.tool()
+async def train_stations(
+    ctx: Context, line: str = "", query: str = ""
+) -> str:
+    """MRT/LRT station map: codes, names, coordinates and line order.
+
+    Served from a bundled station map — no API key needed and always fast.
+    line: optionally filter to one line, e.g. "CCL" or "Circle Line".
+    query: optionally search stations by name or code, e.g. "dhoby" or "NS24".
+    """
+    try:
+        net = _get_train_network()
+    except RuntimeError as exc:
+        return str(exc)
+
+    lines_meta = net["lines"]
+    by_code = net["by_code"]
+
+    q = (query or "").strip().lower()
+    if q:
+        hits = [
+            s for s in net["stations"]
+            if q in s["name"].lower()
+            or any(q in c.lower() for c in s["codes"])
+        ]
+        if not hits:
+            return f"No stations matching {query!r}."
+        out = [f"Stations matching {query!r}:"]
+        for s in sorted(hits, key=lambda s: s["name"]):
+            codes = "/".join(s["codes"])
+            line_names = ", ".join(s["lines"])
+            out.append(
+                f"- {codes} · {s['name']} ({line_names}) · "
+                f"{s['lat']:.4f}, {s['lon']:.4f}"
+            )
+        return "\n".join(out)
+
+    wanted = _normalize_train_line(line) if line else None
+    if line and wanted is None:
+        return (
+            f"Unknown train line {line!r}. Try one of: {', '.join(TRAIN_LINES)}."
+        )
+
+    blocks = []
+    for lcode in (TRAIN_LINES if wanted is None else [wanted]):
+        meta = lines_meta[lcode]
+        blocks.append(f"\n{lcode} — {meta['name']} ({len(meta['codes'])} stations):")
+        for scode in meta["codes"]:
+            s = by_code.get(scode.upper())
+            if s is None:
+                blocks.append(f"{scode} · (name unknown)")
+                continue
+            codes = "/".join(s["codes"])
+            blocks.append(
+                f"{codes} · {s['name']} · {s['lat']:.4f}, {s['lon']:.4f}"
+            )
+    text = "\n".join(blocks).lstrip("\n")
+    if net.get("generated_at"):
+        text += f"\n\n—\nStation map snapshot built {net['generated_at']}."
+    return text
+
+
 # ------------------------------------------------------------- web pages
 
 _PAGE_STYLE = """
@@ -850,17 +1295,21 @@ LANDING_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>SG Bus Arrivals — Muse connector</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{_PAGE_STYLE}</style></head><body>
-<h1>🚌 SG Bus Arrivals</h1>
-<p>A Muse connector for <strong>real-time Singapore bus arrival times</strong>,
-powered by the official LTA DataMall API. Ask in plain language — it answers with
-minutes until arrival, crowding, wheelchair access and single/double deck.</p>
+<h1>🚌🚇 SG Bus + Train</h1>
+<p>A Muse connector for <strong>real-time Singapore bus arrival times</strong>
+and <strong>MRT/LRT service info</strong>, powered by the official LTA
+DataMall API. Ask in plain language — it answers with minutes until arrival,
+crowding, wheelchair access and single/double deck for buses, plus train
+disruption alerts, station crowding and the full station map.</p>
 
 <h2>Try saying</h2>
 <div class="card">
 "When is the next bus 96 at stop 83139?"<br>
 "Which buses stop at Buona Vista?"<br>
 "Is the next bus 151 wheelchair accessible?"<br>
-"What buses are near me?"
+"What buses are near me?"<br>
+"Is the MRT disrupted right now?"<br>
+"How crowded is Dhoby Ghaut station?"
 </div>
 
 <h2>Get connected (2 minutes)</h2>
@@ -890,13 +1339,13 @@ PRIVACY_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{_PAGE_STYLE}</style></head><body>
 <h1>Privacy policy</h1>
-<p>SG Bus Arrivals is a simple relay between you and the LTA DataMall API.
+<p>SG Bus + Train is a simple relay between you and the LTA DataMall API.
 In plain language:</p>
 <ul>
 <li><strong>Your LTA API key</strong> arrives in each request's headers and is
 forwarded to LTA's servers to fetch bus data. It is <strong>never stored</strong>
 on disk or in a database, never logged, and never sent anywhere except LTA.</li>
-<li><strong>Bus stop queries</strong> are forwarded to LTA to answer your
+<li><strong>Bus and train queries</strong> are forwarded to LTA to answer your
 request. We keep no history of what you searched for.</li>
 <li><strong>Demo key:</strong> if you connect without your own key, the server
 may forward its own demo key to LTA on your behalf (rate-limited to 10 tries
