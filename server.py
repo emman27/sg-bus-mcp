@@ -1039,6 +1039,7 @@ async def train_alerts(ctx: Context) -> str:
     now = datetime.now(SGT).strftime("%-I:%M%p").lower().lstrip("0")
 
     # value is one object: {Status, AffectedSegments, Message[]} — not a list.
+    # (verified against live LTA payloads 2026-09-25)
     if isinstance(rows, list):
         payload: dict[str, Any] = {}
     else:
