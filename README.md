@@ -1,12 +1,15 @@
-# 🚌 SG Bus Arrivals — a Muse connector
+# 🚌🚇 SG Bus + Train — a Muse connector
 
-Real-time Singapore bus arrival times as an MCP server, powered by the official
-**LTA DataMall API**. Ask in plain language:
+Real-time Singapore bus arrival times **and MRT/LRT service info** as an MCP
+server, powered by the official **LTA DataMall API**. Ask in plain language:
 
 > "When is the next bus 96 at stop 83139?"
 > "Which buses stop at Buona Vista?"
 > "Is the next bus 151 wheelchair accessible?"
 > "What buses are near me?"
+> "Is the MRT disrupted right now?"
+> "How crowded is Dhoby Ghaut station?"
+> "Which stations are on the Circle Line?"
 
 Built for submission to the **Meta Muse connector directory** (muse.ai/platform).
 
@@ -37,14 +40,47 @@ This connector uses **API keys** auth:
 
 | Tool | What it does |
 |---|---|
-| `bus_arrivals(bus_stop_code)` | Next 3 buses per service at a 5-digit stop code: minutes until arrival, crowding in plain words (seats / standing / limited standing), wheelchair accessibility, single/double deck. |
-| `find_bus_stops(query)` | Case-insensitive search over stop names and roads. The full stop list (~5k stops) is lazy-loaded from LTA on first call (paginated `$skip`) and cached in memory with a 24h TTL. |
-| `nearby_bus_stops(latitude, longitude, max_results=5, radius_m=500)` | Stops near a location (haversine distance), nearest first, with distance in metres. Enables a "buses near me" flow: resolve the user's location → this tool → `bus_arrivals`. |
-| `bus_route(service_no)` | Full ordered route for a service (e.g. `106`, `106A`): every direction with all stops in order — each tagged with its destination (`[→ Shenton Way Ter]`; sequence numbers restart per direction), 5-digit stop code, name and road — plus operator and weekday first/last bus from the origin stop. The full route dataset (~30k records) is lazy-loaded from LTA on first call (paginated `$skip`, fetched in small concurrent batches) and cached in memory with a 24h TTL; stop names come from the stop cache, so no extra LTA calls. |
+| `bus_arrivals(bus_stop_code)` | Next 3 buses per service at a 5-digit stop code: minutes until arrival, crowding in plain words (seats / standing / limited standing), wheelchair accessibility, single/double deck. Each bus is tagged with its terminating stop, resolved from LTA's per-vehicle destination code. |
+| `find_bus_stops(query)` | Case-insensitive search over stop names and roads. Served from the bundled stop list (see below) — instant, no LTA call. |
+| `nearby_bus_stops(latitude, longitude, max_results=5, radius_m=500)` | Stops near a location (haversine distance), nearest first, with distance in metres. Served from the bundled stop list. Enables a "buses near me" flow: resolve the user's location → this tool → `bus_arrivals`. |
+| `bus_route(service_no)` | Full ordered route for a service (e.g. `106`, `106A`): every direction with all stops in order — each tagged with its destination (`[→ Shenton Way Ter]`; sequence numbers restart per direction), 5-digit stop code, name and road — plus operator and weekday first/last bus from the origin stop. Served from the bundled dataset (see below), so it's instant even on a cold start. |
+| `train_alerts()` | Live MRT/LRT service status: any disrupted lines with affected stations, directions, free bridging buses / MRT shuttles and LTA's advisory message — or confirmation that all lines run normally. Updated ad hoc by LTA. |
+| `station_crowding(train_line, station="")` | Live platform crowding (`low` / `moderate` / `high`) for every station on a line, e.g. `station_crowding("CCL")`; optionally filter to one station by code or name. Line names work too (`"Circle Line"`). LTA updates ~every 10 min. |
+| `station_crowd_forecast(train_line, station="", hours=4)` | Crowd forecast in 30-minute slots for the next `hours` (default 4, max 12), stations in line order. LTA refreshes ~once a day. |
+| `train_stations(line="", query="")` | The bundled MRT/LRT station map: codes, names, coordinates and line order for all 9 lines (188 stations). Filter by line or search by name/code — no API key needed, always instant. |
+| `dump_static_data(dataset, skip=0)` | Maintenance: one raw 500-record page of an LTA static dataset (`bus_stops`, `bus_routes`, `bus_services`) as JSON. Used by `scripts/refresh_static_data.py` to rebuild the bundled files — not for everyday questions. |
 
 Bus stop codes are validated as exactly 5 digits. LTA calls have a 10s timeout
 with 2 retries (exponential backoff), per-call latency logging, and
 human-readable errors — agents surface these directly to users.
+
+### Bundled static data (no cold starts)
+
+Reference data that changes rarely lives in `data/*.json`, committed to the
+repo, loaded from disk on first use and kept in memory afterwards:
+
+| File | Contents | Source |
+|---|---|---|
+| `data/bus_stops.json` | ~5k bus stops: code, name, road, coordinates | LTA DataMall `/BusStops` |
+| `data/bus_routes.json` | ~30k route records: service, operator, direction, ordered stops, first/last bus | LTA DataMall `/BusRoutes` |
+| `data/mrt_stations.json` | 188 MRT/LRT stations: codes, names, coordinates, line topology (9 lines) | [ayaka14732/singapore-hdb-map](https://github.com/ayaka14732/singapore-hdb-map) (sourced from LTA DataMall, the LTA system map and data.gov.sg under the Singapore Open Data Licence) |
+
+This means `bus_route`, `find_bus_stops`, `nearby_bus_stops` and
+`train_stations` answer instantly — even the very first call after a deploy —
+with zero LTA traffic. Only genuinely live data (arrivals, alerts, crowding)
+hits the LTA API per request. If a bundled file is ever missing, the server
+falls back to a live LTA fetch so a partial checkout still works.
+
+Tool outputs note the snapshot date (e.g. *"Route data bundled 2026-09-25"*),
+so agents can see the vintage. To refresh the bus datasets:
+
+```bash
+python3 scripts/refresh_static_data.py   # uses the sg-bus CLI + stored credential
+git add data/bus_stops.json data/bus_routes.json && git commit -m "Refresh bus datasets"
+```
+
+`scripts/build_train_stations.py` rebuilds the station map from its upstream
+source (re-run when new stations open).
 
 ### Static pages
 
