@@ -334,7 +334,7 @@ def client():
 def test_landing_page_loads(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "SG Bus Arrivals" in r.text
+    assert "SG Bus + Train" in r.text
     assert "/privacy" in r.text
 
 
