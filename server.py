@@ -161,7 +161,7 @@ async def _lta_get(api_key: str, path: str, params: dict[str, Any], demo: bool =
     for attempt in range(LTA_MAX_RETRIES + 1):
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=LTA_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(timeout=LTA_TIMEOUT_SECONDS, trust_env=False) as client:
                 resp = await client.get(
                     url,
                     headers={"AccountKey": api_key, "Accept": "application/json"},
@@ -276,7 +276,7 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
         return str(exc)  # missing key / demo exhausted — message already explains
 
     try:
-        data = await _lta_get(api_key, "/BusArrivalv2", {"BusStopCode": code}, demo=is_demo)
+        data = await _lta_get(api_key, "/v3/BusArrival", {"BusStopCode": code}, demo=is_demo)
     except (ValueError, RuntimeError) as exc:
         text = str(exc)
         return text + _demo_note(demo_remaining) if is_demo else text
