@@ -888,17 +888,23 @@ _STATIC_DATASETS = {
     "bus_stops": "/BusStops",
     "bus_routes": "/BusRoutes",
     "bus_services": "/BusServices",
+    # TEMP-DEBUG: raw payload probes for the train tools (revert before final)
+    "train_alerts": "/TrainServiceAlerts",
+    "pcd_realtime": "/PCDRealTime",
+    "pcd_forecast": "/PCDForecast",
 }
 
 
 @mcp.tool()
-async def dump_static_data(ctx: Context, dataset: str, skip: int = 0) -> str:
+async def dump_static_data(ctx: Context, dataset: str, skip: int = 0,
+                            train_line: str = "") -> str:
     """Maintenance: return one raw page (500 records) of an LTA static dataset.
 
     Used by scripts/refresh_data.py to rebuild the bundled data/*.json files.
     Not meant for everyday questions — it returns raw JSON, not friendly text.
     dataset is one of: bus_stops, bus_routes, bus_services. skip pages through
     the dataset in 500-record steps (0, 500, 1000, ...).
+    TEMP-DEBUG: train_line probes the PCD endpoints (revert before final).
     """
     dataset = (dataset or "").strip().lower()
     if dataset not in _STATIC_DATASETS:
@@ -915,8 +921,11 @@ async def dump_static_data(ctx: Context, dataset: str, skip: int = 0) -> str:
         return str(exc)  # missing key / demo exhausted — message already explains
 
     try:
+        params: dict[str, Any] = {"$skip": skip}
+        if train_line.strip():
+            params["TrainLine"] = train_line.strip().upper()
         data = await _lta_get(
-            api_key, _STATIC_DATASETS[dataset], {"$skip": skip}, demo=is_demo
+            api_key, _STATIC_DATASETS[dataset], params, demo=is_demo
         )
     except (ValueError, RuntimeError) as exc:
         text = str(exc)
