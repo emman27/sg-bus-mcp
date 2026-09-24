@@ -1326,7 +1326,7 @@ _PAGE_STYLE = """
 """
 
 LANDING_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>SG Bus Arrivals — Muse connector</title>
+<title>SG Bus + Train — Muse connector</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{_PAGE_STYLE}</style></head><body>
 <h1>🚌🚇 SG Bus + Train</h1>
