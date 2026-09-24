@@ -1,4 +1,5 @@
 name: deploy to fly
+# re-trigger 2026-09-24: secret name typo fixed by repo owner
 
 on:
   push:
