@@ -25,6 +25,7 @@ Exposed tools (all read-only):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -787,6 +788,50 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     if is_demo:
         text += _demo_note(demo_remaining)
     return text
+
+
+# ------------------------------------------------------- maintenance
+
+_STATIC_DATASETS = {
+    "bus_stops": "/BusStops",
+    "bus_routes": "/BusRoutes",
+    "bus_services": "/BusServices",
+}
+
+
+@mcp.tool()
+async def dump_static_data(ctx: Context, dataset: str, skip: int = 0) -> str:
+    """Maintenance: return one raw page (500 records) of an LTA static dataset.
+
+    Used by scripts/refresh_data.py to rebuild the bundled data/*.json files.
+    Not meant for everyday questions — it returns raw JSON, not friendly text.
+    dataset is one of: bus_stops, bus_routes, bus_services. skip pages through
+    the dataset in 500-record steps (0, 500, 1000, ...).
+    """
+    dataset = (dataset or "").strip().lower()
+    if dataset not in _STATIC_DATASETS:
+        return (
+            f"Unknown dataset {dataset!r}. "
+            f"Choose one of: {', '.join(sorted(_STATIC_DATASETS))}."
+        )
+    if skip < 0:
+        skip = 0
+
+    try:
+        api_key, is_demo, demo_remaining = await _resolve_api_key(ctx)
+    except (ValueError, RuntimeError) as exc:
+        return str(exc)  # missing key / demo exhausted — message already explains
+
+    try:
+        data = await _lta_get(
+            api_key, _STATIC_DATASETS[dataset], {"$skip": skip}, demo=is_demo
+        )
+    except (ValueError, RuntimeError) as exc:
+        text = str(exc)
+        return text + _demo_note(demo_remaining) if is_demo else text
+
+    records = data.get("value") or []
+    return json.dumps({"skip": skip, "count": len(records), "records": records})
 
 
 # ------------------------------------------------------------- web pages
