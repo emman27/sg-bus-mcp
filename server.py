@@ -239,7 +239,9 @@ async def _lta_get(api_key: str, path: str, params: dict[str, Any], demo: bool =
 
 # ------------------------------------------------------------------ tools
 
-def _describe_bus(bus: dict[str, Any], now: datetime) -> str:
+def _describe_bus(
+    bus: dict[str, Any], now: datetime, destination: str = ""
+) -> str:
     eta_raw = (bus.get("EstimatedArrival") or "").strip()
     if not eta_raw:
         return "not currently in service"
@@ -248,6 +250,8 @@ def _describe_bus(bus: dict[str, Any], now: datetime) -> str:
     if minutes is None:
         return "arrival time unavailable"
     when = "arriving now" if minutes < 1 else f"{minutes} min"
+    if destination:
+        when += f" → {destination}"
 
     load = LOAD_WORDS.get((bus.get("Load") or "").upper(), "crowding unknown")
     wab = "wheelchair accessible" if (bus.get("Feature") or "").upper() == "WAB" else "not wheelchair accessible"
@@ -257,6 +261,46 @@ def _describe_bus(bus: dict[str, Any], now: datetime) -> str:
     if deck:
         parts.append(deck)
     return ", ".join(parts)
+
+
+def _describe_service(
+    svc: dict[str, Any], now: datetime, dest_names: dict[str, str]
+) -> str:
+    """One service line, with direction when LTA reports it.
+
+    Every arriving bus carries OriginCode/DestinationCode (vehicle level).
+    When all buses on the service share one destination it goes on the
+    service line ("- 74 (SBST) → Buona Vista Ter: ..."). When they differ
+    (e.g. short-working trips) each bus is annotated individually. Loop
+    services (origin == destination) get a "(loop)" marker.
+    """
+    slots = [svc.get(name) or {} for name in ("NextBus", "NextBus2", "NextBus3")]
+    active = [b for b in slots if (b.get("EstimatedArrival") or "").strip()]
+    head = f"- {svc.get('ServiceNo', '?')} ({svc.get('Operator', '?')})"
+
+    uniq = list(
+        dict.fromkeys(
+            (b.get("DestinationCode") or "").strip() for b in active
+        )
+    )
+    uniq = [code for code in uniq if code]
+
+    if len(uniq) == 1:
+        dest = dest_names.get(uniq[0], uniq[0])
+        origin = (active[0].get("OriginCode") or "").strip()
+        loop = " (loop)" if origin and origin == uniq[0] else ""
+        buses = " | ".join(_describe_bus(b, now) for b in slots)
+        return f"{head} → {dest}{loop}: {buses}"
+
+    # Mixed destinations, or none reported: annotate each bus on its own.
+    parts = []
+    for bus in slots:
+        code = (bus.get("DestinationCode") or "").strip()
+        dest = ""
+        if code and (bus.get("EstimatedArrival") or "").strip():
+            dest = dest_names.get(code, code)
+        parts.append(_describe_bus(bus, now, destination=dest))
+    return f"{head}: {' | '.join(parts)}"
 
 
 def _minutes_until(eta_iso: str, now: datetime) -> Optional[int]:
@@ -275,7 +319,9 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
 
     Give the 5-digit bus stop code (printed on the stop's sign, e.g. "83139").
     Returns each service with its next three buses: minutes until arrival,
-    crowding in plain words, wheelchair accessibility, and single/double deck.
+    crowding in plain words, wheelchair accessibility, single/double deck,
+    and the direction each bus is heading (its terminating stop, resolved
+    from LTA's per-bus destination data — e.g. "→ Buona Vista Ter").
     """
     code = (bus_stop_code or "").strip()
     if not re.fullmatch(r"\d{5}", code):
@@ -306,14 +352,38 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
         )
         return text + _demo_note(demo_remaining) if is_demo else text
 
+    # Every bus carries a DestinationCode (vehicle level). Collect them all so
+    # stop names can be resolved in one pass through the (cached) stop list.
+    dest_codes: set[str] = set()
+    for svc in services:
+        for slot in ("NextBus", "NextBus2", "NextBus3"):
+            bus = svc.get(slot) or {}
+            if not (bus.get("EstimatedArrival") or "").strip():
+                continue
+            code = (bus.get("DestinationCode") or "").strip()
+            if code:
+                dest_codes.add(code)
+
+    dest_names: dict[str, str] = {}
+    if dest_codes:
+        try:
+            stops = await _get_all_bus_stops(api_key, demo=is_demo)
+            by_code = {
+                str(s.get("BusStopCode")): str(s.get("Description") or "")
+                for s in stops
+            }
+            dest_names = {c: by_code.get(c) or c for c in dest_codes}
+        except (ValueError, RuntimeError):
+            # Name resolution must never break arrivals; fall back to codes.
+            logger.warning(
+                "bus_arrivals: stop-name lookup failed, using raw codes"
+            )
+            dest_names = {c: c for c in dest_codes}
+
     now = datetime.now(SGT)
     lines = [f"Bus stop {code} — {len(services)} service(s):"]
     for svc in services:
-        buses = " | ".join(
-            _describe_bus(svc.get(slot) or {}, now)
-            for slot in ("NextBus", "NextBus2", "NextBus3")
-        )
-        lines.append(f"- {svc.get('ServiceNo', '?')} ({svc.get('Operator', '?')}): {buses}")
+        lines.append(_describe_service(svc, now, dest_names))
     text = "\n".join(lines)
     if is_demo:
         text += _demo_note(demo_remaining)

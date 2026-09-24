@@ -98,6 +98,123 @@ def test_bus_arrivals_with_no_services_says_so_plainly(monkeypatch):
     assert "No buses are currently serving stop 83139" in text
 
 
+def _arrival_payload_with_direction():
+    now = datetime.now(SGT)
+    return {
+        "Services": [
+            {
+                "ServiceNo": "74",
+                "Operator": "SBST",
+                "NextBus": {
+                    "EstimatedArrival": (now + timedelta(minutes=5)).isoformat(),
+                    "OriginCode": "64009",
+                    "DestinationCode": "77131",
+                    "Load": "SEA",
+                    "Feature": "WAB",
+                    "Type": "DD",
+                },
+                "NextBus2": {
+                    "EstimatedArrival": (now + timedelta(minutes=20)).isoformat(),
+                    "OriginCode": "64009",
+                    "DestinationCode": "77131",
+                    "Load": "SDA",
+                    "Feature": "",
+                    "Type": "SD",
+                },
+                "NextBus3": {},
+            },
+            {
+                "ServiceNo": "15",
+                "Operator": "GAS",
+                "NextBus": {
+                    "EstimatedArrival": (now + timedelta(minutes=3)).isoformat(),
+                    "OriginCode": "77009",
+                    "DestinationCode": "77009",
+                    "Load": "SEA",
+                    "Feature": "WAB",
+                    "Type": "SD",
+                },
+                "NextBus2": {},
+                "NextBus3": {},
+            },
+        ]
+    }
+
+
+def _canned_stops_with_terminals():
+    return [
+        {"BusStopCode": "77131", "Description": "Buona Vista Ter",
+         "RoadName": "North Buona Vista Rd", "Latitude": 1.306, "Longitude": 103.782},
+        {"BusStopCode": "77009", "Description": "Marine Parade Rd",
+         "RoadName": "Marine Parade Rd", "Latitude": 1.31, "Longitude": 103.91},
+    ]
+
+
+def test_bus_arrivals_shows_direction_from_destination_code(monkeypatch):
+    async def fake_lta(api_key, path, params, demo=False):
+        return _arrival_payload_with_direction()
+
+    async def fake_stops(api_key, demo=False):
+        return _canned_stops_with_terminals()
+
+    monkeypatch.setattr(server, "_lta_get", fake_lta)
+    monkeypatch.setattr(server, "_get_all_bus_stops", fake_stops)
+    text = run(server.bus_arrivals(FakeCtx(HEADER_KEY), "19099"))
+    assert "→ Buona Vista Ter" in text
+    assert "(loop)" in text  # service 15: origin == destination
+
+
+def test_bus_arrivals_mixed_destinations_annotated_per_bus(monkeypatch):
+    now = datetime.now(SGT)
+
+    async def fake_lta(api_key, path, params, demo=False):
+        return {
+            "Services": [
+                {
+                    "ServiceNo": "74",
+                    "Operator": "SBST",
+                    "NextBus": {
+                        "EstimatedArrival": (now + timedelta(minutes=5)).isoformat(),
+                        "OriginCode": "64009",
+                        "DestinationCode": "77131",
+                        "Load": "SEA",
+                        "Feature": "WAB",
+                        "Type": "DD",
+                    },
+                    "NextBus2": {
+                        "EstimatedArrival": (now + timedelta(minutes=20)).isoformat(),
+                        "OriginCode": "64009",
+                        "DestinationCode": "64009",
+                        "Load": "SDA",
+                        "Feature": "",
+                        "Type": "SD",
+                    },
+                    "NextBus3": {},
+                }
+            ]
+        }
+
+    async def fake_stops(api_key, demo=False):
+        return _canned_stops_with_terminals()
+
+    monkeypatch.setattr(server, "_lta_get", fake_lta)
+    monkeypatch.setattr(server, "_get_all_bus_stops", fake_stops)
+    text = run(server.bus_arrivals(FakeCtx(HEADER_KEY), "19099"))
+    # Destinations differ bus-to-bus, so each bus carries its own arrow.
+    assert "5 min → Buona Vista Ter" in text
+    assert "20 min → 64009" in text  # unknown code falls back to the code
+
+
+def test_bus_arrivals_without_destination_codes_has_no_arrows(monkeypatch):
+    async def fake_lta(api_key, path, params, demo=False):
+        return _arrival_payload()  # no OriginCode/DestinationCode at all
+
+    monkeypatch.setattr(server, "_lta_get", fake_lta)
+    text = run(server.bus_arrivals(FakeCtx(HEADER_KEY), "83139"))
+    assert "→" not in text
+    assert "6 min" in text  # arrivals themselves still work
+
+
 # -------------------------------------------------------- find_bus_stops
 
 
