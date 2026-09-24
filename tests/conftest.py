@@ -47,15 +47,17 @@ def _clean_static_data_state():
     server._data_files.clear()
     server._bus_stops = None
     server._bus_stops_fetched_at = None
-    server._bus_routes = None
-    server._bus_routes_fetched_at = None
-    server._bus_routes_vintage = None
+    server._bundled_routes = None
+    server._bundled_vintage = None
+    server._live_routes = None
+    server._live_routes_fetched_at = None
     server._train_network = None
     yield
     server._data_files.clear()
     server._bus_stops = None
     server._bus_stops_fetched_at = None
-    server._bus_routes = None
-    server._bus_routes_fetched_at = None
-    server._bus_routes_vintage = None
+    server._bundled_routes = None
+    server._bundled_vintage = None
+    server._live_routes = None
+    server._live_routes_fetched_at = None
     server._train_network = None
