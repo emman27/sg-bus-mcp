@@ -5,7 +5,7 @@ validation, key handling, the demo budget, and the web pages. All LTA
 network calls are stubbed out — nothing here touches the real API.
 """
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from starlette.testclient import TestClient
@@ -392,7 +392,8 @@ def _fake_route_pages(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "_lta_get", fake_lta)
     monkeypatch.setattr(server, "_get_all_bus_stops", fake_stops)
-    monkeypatch.setattr(server, "_bus_routes", None)
+    monkeypatch.setattr(server, "_live_routes", None)
+    monkeypatch.setattr(server, "_live_routes_fetched_at", None)
     monkeypatch.setattr(server, "STOP_PAGE_SIZE", 2)
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
 
@@ -659,18 +660,21 @@ def test_station_crowd_forecast_groups_slots_in_line_order(monkeypatch, tmp_path
 
     async def fake_lta(api_key, path, params, demo=False):
         assert path == "/PCDForecast"
-        return {"value": [
-            # Deliberately shuffled: NS2 row sorts after NS1 via line order.
-            {"Station": "NS2", "Start": "2026-09-25T10:00:00+08:00",
-             "CrowdLevel": "m"},
-            {"Station": "NS1", "Start": "2026-09-25T10:00:00+08:00",
-             "CrowdLevel": "l"},
-            {"Station": "NS1", "Start": "2026-09-25T10:30:00+08:00",
-             "CrowdLevel": "m"},
-            # Yesterday's slot is outside the window and must be dropped.
-            {"Station": "NS1", "Start": "2026-09-24T10:00:00+08:00",
-             "CrowdLevel": "h"},
-        ]}
+        return {"value": [{
+            "Date": "2026-09-25T00:00:00+08:00",
+            "Stations": [
+                # Deliberately shuffled: NS2 sorts after NS1 via line order.
+                {"Station": "NS2", "Interval": [
+                    {"Start": "2026-09-25T10:00:00+08:00", "CrowdLevel": "m"},
+                ]},
+                {"Station": "NS1", "Interval": [
+                    {"Start": "2026-09-25T10:00:00+08:00", "CrowdLevel": "l"},
+                    {"Start": "2026-09-25T10:30:00+08:00", "CrowdLevel": "m"},
+                    # Yesterday's slot is outside the window and must be dropped.
+                    {"Start": "2026-09-24T10:00:00+08:00", "CrowdLevel": "h"},
+                ]},
+            ],
+        }]}
 
     monkeypatch.setattr(server, "_lta_get", fake_lta)
 
@@ -690,31 +694,43 @@ def test_station_crowd_forecast_groups_slots_in_line_order(monkeypatch, tmp_path
 def test_train_alerts_all_clear(monkeypatch):
     async def fake_lta(api_key, path, params, demo=False):
         assert path == "/TrainServiceAlerts"
-        return {"value": []}
+        return {"value": {
+            "Status": 1,
+            "AffectedSegments": [],
+            "Message": [
+                {"Content": "Bukit Panjang LRT closed on Sundays for renewal works.",
+                 "CreatedDate": "2026-09-18 20:06:30"},
+            ],
+        }}
     monkeypatch.setattr(server, "_lta_get", fake_lta)
     text = run(server.train_alerts(FakeCtx(HEADER_KEY)))
     assert "running normally" in text
+    assert "Bukit Panjang LRT closed on Sundays" in text
+    assert "2026-09-18 20:06:30" in text
 
 
 def test_train_alerts_reports_disruption(monkeypatch):
     async def fake_lta(api_key, path, params, demo=False):
-        return {"value": [
-            {"Status": "1", "Line": "NSL", "Message": "Minor delay"},
-            {"Status": "2", "Line": "EWL", "Direction": "Towards Pasir Ris",
-             "Stations": "EW13-EW16",
-             "FreePublicBus": "Yes, at affected stations",
-             "FreeMRTShuttle": "Yes", "MRTShuttleDirection": "Both",
-             "Message": "Track fault near City Hall"},
-        ]}
+        return {"value": {
+            "Status": 2,
+            "AffectedSegments": [
+                {"Line": "EWL", "Direction": "Towards Pasir Ris",
+                 "Stations": "EW13-EW16",
+                 "FreePublicBus": "Yes, at affected stations",
+                 "FreeMRTShuttle": "Yes", "MRTShuttleDirection": "Both"},
+            ],
+            "Message": [
+                {"Content": "Track fault near City Hall.",
+                 "CreatedDate": "2026-09-25 09:00:00"},
+            ],
+        }}
     monkeypatch.setattr(server, "_lta_get", fake_lta)
     text = run(server.train_alerts(FakeCtx(HEADER_KEY)))
     assert "⚠️ EWL — disrupted" in text
     assert "Towards Pasir Ris" in text
     assert "EW13-EW16" in text
     assert "Free bridging buses: Yes, at affected stations" in text
-    assert "Track fault near City Hall" in text
-    # Status-1 rows are not disruptions and stay quiet.
-    assert "Minor delay" not in text
+    assert "Track fault near City Hall." in text
 
 
 def test_train_stations_lists_line_from_map(monkeypatch, tmp_path):
@@ -765,6 +781,21 @@ def test_static_tools_need_no_key_when_bundled(monkeypatch, tmp_path):
     assert "11111" in text
     text = run(server.bus_route(no_auth, "106"))
     assert "106 — TT (1 direction):" in text
+    assert "Route data bundled 2026-09-25" in text
+
+
+def test_bundled_and_live_route_caches_stay_separate(monkeypatch, tmp_path):
+    """A live-fallback index must never be mistaken for bundled data."""
+    _bundled_bus_files(tmp_path)
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    # Pretend a live fetch populated the live cache with garbage.
+    monkeypatch.setattr(server, "_live_routes",
+                        {"999": {1: {"stops": [], "operator": ""}}})
+    monkeypatch.setattr(server, "_live_routes_fetched_at",
+                        datetime.now(timezone.utc))
+    bundled = server._get_bundled_bus_routes()
+    assert "106" in bundled and "999" not in bundled
+    assert server._bundled_vintage == "2026-09-25"
 
 
 def test_static_tools_ask_for_key_only_when_no_bundled_file(monkeypatch, tmp_path):
