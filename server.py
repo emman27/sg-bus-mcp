@@ -74,7 +74,25 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-mcp = FastMCP("sg-bus-train")
+mcp = FastMCP(
+    "sg-bus-train",
+    instructions=(
+        "Singapore public transit data: buses (live arrivals, stops, routes) "
+        "and MRT/LRT (service alerts, crowding, forecasts, station map).\n\n"
+        "Chaining tools into multi-leg journeys is normal and expected — "
+        "there is no single journey-planner tool, you are the planner. "
+        "For 'how do I get from A to B': (1) get coordinates for both ends; "
+        "(2) use nearby_bus_stops at the origin and train_stations to find "
+        "the station nearest the destination; (3) prefer a no-transfer MRT "
+        "leg where one exists, otherwise chain bus -> MRT -> bus/MRT; "
+        "(4) verify every bus leg's direction with bus_route — the "
+        "destination tag ([-> ...]) must cover both the boarding and the "
+        "alighting stop, and you must never recommend a stop without "
+        "reading its direction header; (5) call bus_arrivals for live "
+        "timing close to departure, and train_alerts for disruptions.\n\n"
+        "There is no real-time train ARRIVAL api — say so plainly if asked."
+    ),
+)
 
 # The MCP SDK's DNS-rebinding protection defaults to localhost-only hosts,
 # which 421s every request behind Fly's edge proxy. Allow our public
@@ -329,6 +347,8 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
     crowding in plain words, wheelchair accessibility, single/double deck,
     and the direction each bus is heading (its terminating stop, resolved
     from LTA's per-bus destination data — e.g. "→ Buona Vista Ter").
+    Combine with nearby_bus_stops, find_bus_stops and train_stations to
+    plan multi-leg bus+MRT journeys.
     """
     code = (bus_stop_code or "").strip()
     if not re.fullmatch(r"\d{5}", code):
@@ -554,6 +574,7 @@ async def nearby_bus_stops(
     the closest stops within radius_m metres, each with its 5-digit code,
     name, road, and distance in metres. Pass a code from the results to
     bus_arrivals for live timings. max_results caps at 20; radius_m at 2000.
+    Combine with train_stations and bus_arrivals for multi-leg journeys.
     """
     try:
         lat, lng = float(latitude), float(longitude)
@@ -804,7 +825,9 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     tagged with its destination (e.g. [→ Shenton Way Ter]); sequence
     numbers restart at 1 for each direction, so always read the tag, not
     just the stop code. Served from the bundled route dataset — instant,
-    and needs no API key.
+    and needs no API key. Use this to verify a service's direction before
+    sending someone to a stop: the destination tag must cover both the
+    boarding and the alighting stop.
     """
     svc = (service_no or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{1,5}", svc):
@@ -1260,6 +1283,8 @@ async def train_stations(
     Served from a bundled station map — no API key needed and always fast.
     line: optionally filter to one line, e.g. "CCL" or "Circle Line".
     query: optionally search stations by name or code, e.g. "dhoby" or "NS24".
+    Combine with nearby_bus_stops and bus_arrivals to plan multi-leg
+    bus+MRT journeys.
     """
     try:
         net = _get_train_network()
