@@ -347,6 +347,13 @@ async def bus_arrivals(ctx: Context, bus_stop_code: str) -> str:
     crowding in plain words, wheelchair accessibility, single/double deck,
     and the direction each bus is heading (its terminating stop, resolved
     from LTA's per-bus destination data — e.g. "→ Buona Vista Ter").
+    NOTE: the terminating stop is only the end of the line — each service
+    also serves dozens of intermediate stops. When asked for a bus to
+    destination X, do not just match the terminating stop: call bus_route
+    for every service listed here and check whether X appears among its
+    stops (e.g. service 196 terminates at Bedok Int yet passes Buona Vista).
+    The boarding stop must come before the alighting stop in the same
+    direction.
     Combine with nearby_bus_stops, find_bus_stops and train_stations to
     plan multi-leg bus+MRT journeys.
     """
@@ -827,7 +834,9 @@ async def bus_route(ctx: Context, service_no: str) -> str:
     just the stop code. Served from the bundled route dataset — instant,
     and needs no API key. Use this to verify a service's direction before
     sending someone to a stop: the destination tag must cover both the
-    boarding and the alighting stop.
+    boarding and the alighting stop. Also use this to find through-services
+    to a destination: a service reaches X when X appears among its stops
+    after the boarding stop in the same direction.
     """
     svc = (service_no or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{1,5}", svc):
