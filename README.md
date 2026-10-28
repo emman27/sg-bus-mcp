@@ -90,6 +90,16 @@ The same app serves three pages (needed for directory submission):
 - `/privacy` — plain language: keys forwarded per-request to LTA only, nothing stored, no analytics
 - `/terms` — as-is, not affiliated with LTA or Meta
 
+The pages are themed with [Astryx](https://github.com/facebook/astryx),
+Meta's open-source design system — specifically the design tokens of
+`@astryxdesign/theme-neutral` (v0.7.4), inlined into `_PAGE_STYLE` in
+`server.py`. Astryx themes are plain CSS custom properties, so the tokens
+apply directly to these server-rendered pages with no JS build step and
+no CSS fetched at runtime; the `light-dark()` colour tokens give the
+pages automatic dark mode, and the typeface is Figtree, the neutral
+theme's font. To re-theme, swap the token values in `_PAGE_STYLE` for
+another Astryx theme's (butter, matcha, stone, …).
+
 ## Local dev
 
 ```bash
