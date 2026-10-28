@@ -1349,20 +1349,182 @@ async def train_stations(
 
 # ------------------------------------------------------------- web pages
 
+# The three static pages are themed with Astryx, Meta's open-source design
+# system (https://github.com/facebook/astryx) — specifically the design
+# tokens of @astryxdesign/theme-neutral@0.7.4, inlined below.
+#
+# Why tokens rather than the Astryx React components: an Astryx theme is
+# plain CSS custom properties by design — upstream's own guidance is that
+# you retheme by writing CSS, with no build plugin required — while this
+# server is a single-file Python app with no JS build step. Inlining the
+# neutral theme's token values keeps the pages self-contained (no CSS is
+# fetched at runtime) while giving them the exact Astryx palette, type
+# scale, radii and shadows. Dark mode comes free: the colour tokens use
+# light-dark() exactly as upstream emits them, switched by the visitor's
+# prefers-color-scheme. The typeface is Figtree, the neutral theme's font
+# (its fonts.css loads it from Google Fonts); each page links it, and the
+# token's system fallback stack applies when it can't load.
+
 _PAGE_STYLE = """
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 680px;
-         margin: 3rem auto; padding: 0 1.5rem; color: #1a1a1a; line-height: 1.6; }
-  h1 { font-size: 1.8rem; } h2 { font-size: 1.2rem; margin-top: 2rem; }
-  code { background: #f1f3f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.9em; }
-  .card { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px;
-          padding: 1rem 1.25rem; margin: 1rem 0; }
-  a { color: #1971c2; } footer { margin-top: 3rem; font-size: 0.85rem; color: #868e96; }
+@layer reset, astryx-theme, page;
+
+@layer astryx-theme {
+  [data-astryx-theme="neutral"] {
+    color-scheme: light dark;
+    --font-family-body: Figtree, -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, Helvetica, Arial, sans-serif;
+    --font-family-heading: Figtree, -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, Helvetica, Arial, sans-serif;
+    --font-family-code: ui-monospace, "SF Mono", Monaco, Consolas,
+      "Liberation Mono", "Courier New", monospace;
+    --font-size-sm: 0.75rem;
+    --font-size-base: 0.875rem;
+    --font-size-lg: 1.0625rem;
+    --font-size-xl: 1.25rem;
+    --font-size-2xl: 1.5rem;
+    --font-size-3xl: 1.8125rem;
+    --font-weight-normal: 400;
+    --font-weight-medium: 500;
+    --font-weight-semibold: 600;
+    --font-weight-bold: 700;
+    --text-display-3-size: var(--font-size-3xl);
+    --text-display-3-leading: 1.3793;
+    --text-heading-1-size: var(--font-size-2xl);
+    --text-heading-1-weight: var(--font-weight-semibold);
+    --text-heading-1-leading: 1.3333;
+    --text-heading-2-size: var(--font-size-xl);
+    --text-heading-2-weight: var(--font-weight-semibold);
+    --text-heading-2-leading: 1.4;
+    --text-body-size: var(--font-size-lg);
+    --text-body-leading: 1.6;
+    --text-code-size: var(--font-size-base);
+    --text-code-leading: 1.4286;
+    --text-supporting-size: var(--font-size-sm);
+    --text-supporting-leading: 1.6667;
+    --spacing-1: 0.25rem;
+    --spacing-2: 0.5rem;
+    --spacing-3: 0.75rem;
+    --spacing-4: 1rem;
+    --spacing-5: 1.25rem;
+    --spacing-6: 1.5rem;
+    --spacing-8: 2rem;
+    --spacing-10: 2.5rem;
+    --spacing-12: 3rem;
+    --color-background-body: light-dark(#f1f1f1, #1b1b1b);
+    --color-background-surface: light-dark(#ffffff, #262626);
+    --color-background-card: light-dark(#ffffff, #1b1b1b);
+    --color-background-muted: light-dark(#f1f1f1, #1b1b1b);
+    --color-accent: light-dark(#1b1b1b, #f1f1f1);
+    --color-neutral: light-dark(#0000000f, #ffffff1a);
+    --color-text-primary: light-dark(#000000, #ffffff);
+    --color-text-secondary: light-dark(#474747, #9e9e9e);
+    --color-text-blue: light-dark(#003978, #a1caff);
+    --color-border: light-dark(#00000014, #ffffff1a);
+    --color-border-emphasized: light-dark(#d4d4d4, #525252);
+    --color-border-blue: light-dark(#a1caff, #5aa0f8);
+    --radius-inner: 0.375rem;
+    --radius-element: 0.625rem;
+    --radius-container: 0.75rem;
+    --radius-page: 1.75rem;
+    --shadow-low: 0 2px 4px light-dark(oklch(0 0 0 / 5%), oklch(0 0 0 / 25%)),
+      0 4px 8px light-dark(oklch(0 0 0 / 10%), oklch(0 0 0 / 40%)),
+      inset 0 0 0 1px light-dark(transparent, oklch(1 0 0 / 8%));
+    --duration-fast: 125ms;
+  }
+}
+
+@layer page {
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--color-background-body);
+    color: var(--color-text-primary);
+    font-family: var(--font-family-body);
+    font-size: var(--text-body-size);
+    line-height: var(--text-body-leading);
+    padding: var(--spacing-10) var(--spacing-4);
+  }
+  .page {
+    max-width: 680px;
+    margin: 0 auto;
+    background: var(--color-background-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-page);
+    box-shadow: var(--shadow-low);
+    padding: var(--spacing-10) var(--spacing-8);
+  }
+  h1 {
+    font-family: var(--font-family-heading);
+    font-size: var(--text-display-3-size);
+    font-weight: var(--font-weight-normal);
+    line-height: var(--text-display-3-leading);
+    margin: 0 0 var(--spacing-4);
+  }
+  h2 {
+    font-family: var(--font-family-heading);
+    font-size: var(--text-heading-2-size);
+    font-weight: var(--text-heading-2-weight);
+    line-height: var(--text-heading-2-leading);
+    margin: var(--spacing-8) 0 var(--spacing-3);
+  }
+  p { margin: var(--spacing-3) 0; }
+  strong { font-weight: var(--font-weight-semibold); }
+  code {
+    font-family: var(--font-family-code);
+    font-size: var(--text-code-size);
+    line-height: var(--text-code-leading);
+    background: var(--color-neutral);
+    padding: 0.15rem 0.4rem;
+    border-radius: var(--radius-inner);
+  }
+  .card {
+    background: var(--color-background-muted);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-container);
+    padding: var(--spacing-4) var(--spacing-5);
+    margin: var(--spacing-4) 0;
+    line-height: 1.9;
+  }
+  a {
+    color: var(--color-text-blue);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    transition: color var(--duration-fast) ease;
+  }
+  a:hover { color: var(--color-accent); }
+  a:focus-visible {
+    outline: 2px solid var(--color-border-blue);
+    outline-offset: 2px;
+    border-radius: var(--radius-inner);
+  }
+  footer {
+    margin-top: var(--spacing-10);
+    padding-top: var(--spacing-4);
+    border-top: 1px solid var(--color-border);
+    font-size: var(--text-supporting-size);
+    line-height: var(--text-supporting-leading);
+    color: var(--color-text-secondary);
+  }
+  @media (max-width: 560px) {
+    body { padding: var(--spacing-4) var(--spacing-3); }
+    .page { border-radius: var(--radius-container); padding: var(--spacing-6) var(--spacing-5); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    a { transition: none; }
+  }
+}
 """
 
-LANDING_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+_FONT_LINKS = """<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">"""
+
+LANDING_HTML = f"""<!doctype html><html lang="en" data-astryx-theme="neutral"><head><meta charset="utf-8">
 <title>SG Bus + Train — Muse connector</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{_PAGE_STYLE}</style></head><body>
+<meta name="color-scheme" content="light dark">
+{_FONT_LINKS}
+<style>{_PAGE_STYLE}</style></head><body><main class="page">
 <h1>🚌🚇 SG Bus + Train</h1>
 <p>A Muse connector for <strong>real-time Singapore bus arrival times</strong>
 and <strong>MRT/LRT service info</strong>, powered by the official LTA
@@ -1400,12 +1562,14 @@ unlimited use, grab your own free key above — it takes two minutes.</p>
 
 <footer><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
 Not affiliated with LTA or Meta.</footer>
-</body></html>"""
+</main></body></html>"""
 
-PRIVACY_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+PRIVACY_HTML = f"""<!doctype html><html lang="en" data-astryx-theme="neutral"><head><meta charset="utf-8">
 <title>Privacy — SG Bus Arrivals</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{_PAGE_STYLE}</style></head><body>
+<meta name="color-scheme" content="light dark">
+{_FONT_LINKS}
+<style>{_PAGE_STYLE}</style></head><body><main class="page">
 <h1>Privacy policy</h1>
 <p>SG Bus + Train is a simple relay between you and the LTA DataMall API.
 In plain language:</p>
@@ -1426,12 +1590,14 @@ service healthy.</li>
 </ul>
 <p>Questions: open an issue on the project's GitHub repository.</p>
 <footer><a href="/">Home</a> · <a href="/terms">Terms</a></footer>
-</body></html>"""
+</main></body></html>"""
 
-TERMS_HTML = f"""<!doctype html><html><head><meta charset="utf-8">
+TERMS_HTML = f"""<!doctype html><html lang="en" data-astryx-theme="neutral"><head><meta charset="utf-8">
 <title>Terms — SG Bus Arrivals</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>{_PAGE_STYLE}</style></head><body>
+<meta name="color-scheme" content="light dark">
+{_FONT_LINKS}
+<style>{_PAGE_STYLE}</style></head><body><main class="page">
 <h1>Terms of use</h1>
 <ul>
 <li>SG Bus Arrivals is provided <strong>as-is</strong>, without warranties of any
@@ -1444,7 +1610,7 @@ LTA's DataMall terms of use.</li>
 <li>We may rate-limit abusive traffic to protect the service.</li>
 </ul>
 <footer><a href="/">Home</a> · <a href="/privacy">Privacy</a></footer>
-</body></html>"""
+</main></body></html>"""
 
 
 @mcp.custom_route("/", methods=["GET"])

@@ -350,6 +350,20 @@ def test_terms_page_loads(client):
     assert "as-is" in r.text
 
 
+def test_pages_use_astryx_neutral_theme(client):
+    # All three static pages carry the Astryx neutral theme: the theme
+    # attribute Astryx scopes its tokens to, the token definitions
+    # themselves (colours via light-dark(), so dark mode is automatic),
+    # and Figtree, the neutral theme's typeface.
+    for path in ("/", "/privacy", "/terms"):
+        r = client.get(path)
+        assert r.status_code == 200
+        assert 'data-astryx-theme="neutral"' in r.text
+        assert "--color-background-surface" in r.text
+        assert "light-dark(" in r.text
+        assert "Figtree" in r.text
+
+
 # ---------------------------------------------------------- bus_route
 
 
